@@ -218,9 +218,10 @@ nav{display:flex;gap:2px;}
     <button class="nav-btn" data-page="knowledge">知识中心</button>
     <button class="nav-btn" data-page="monitor">系统监控</button>
     <button class="nav-btn" data-page="alerts">告警中心</button>
+    <button class="nav-btn" data-page="command">指挥台</button>
   </nav>
   <div class="header-right">
-    <span style="font-size:10px;color:var(--text3);background:rgba(42,127,255,.1);border:1px solid rgba(42,127,255,.2);border-radius:10px;padding:2px 8px;margin-right:6px;">v1.2.1</span>
+    <span style="font-size:10px;color:var(--text3);background:rgba(42,127,255,.1);border:1px solid rgba(42,127,255,.2);border-radius:10px;padding:2px 8px;margin-right:6px;">v2.0.0</span>
     <button class="lang-btn" id="lang-btn" onclick="toggleLang()">EN</button>
     <div><div id="clock">--:--:--</div><div id="clock-date">----</div></div>
     <div class="ws-dot" id="ws-dot"></div>
@@ -644,6 +645,48 @@ nav{display:flex;gap:2px;}
   </div>
 </div>
 
+<!-- ═══════════════ PAGE 7: COMMAND CENTER ═══════════════ -->
+<div class="page" id="page-command">
+<div class="pfull">
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+    <!-- Token Stats -->
+    <div class="panel">
+      <div class="ptitle" id="pt-tokens">Token 消耗统计</div>
+      <div style="height:180px;"><canvas id="token-chart"></canvas></div>
+    </div>
+    <!-- Agent Log Stream -->
+    <div class="panel">
+      <div class="ptitle" id="pt-agentlogs">实时日志流</div>
+      <div id="agent-log-stream" style="max-height:170px;overflow-y:auto;font-size:10px;display:flex;flex-direction:column;gap:2px;"></div>
+    </div>
+  </div>
+  <!-- Workflow Management -->
+  <div class="panel" style="margin-top:10px;">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+      <div class="ptitle" style="margin:0;" id="pt-workflow">工作流管理</div>
+      <button class="btn btn-p btn-sm" onclick="showCreateWorkflow()" id="btn-create-wf">创建工作流</button>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+      <div>
+        <table class="dtable">
+          <thead><tr><th>ID</th><th>名称</th><th>状态</th><th>任务数</th><th>操作</th></tr></thead>
+          <tbody id="wf-tbody"></tbody>
+        </table>
+      </div>
+      <div>
+        <div class="ptitle" style="font-size:10px;" id="pt-taskint">任务干预</div>
+        <div id="task-intervene" style="font-size:10px;color:var(--text3);padding:10px;">选择一个任务进行干预操作</div>
+      </div>
+    </div>
+  </div>
+  <!-- Peer Nodes -->
+  <div class="panel" style="margin-top:10px;">
+    <div class="ptitle" id="pt-peers">对等节点</div>
+    <div id="peer-list" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
+  </div>
+</div>
+</div>
+
 <script>
 'use strict';
 const API=window.location.protocol==='file:'?'http://localhost:9527':window.location.origin;
@@ -652,7 +695,7 @@ const WS_URL=window.location.protocol==='file:'?'ws://localhost:9527/ws':((windo
 // ══ i18n ══════════════════════════════════════════════
 const STRINGS={
 zh:{
-  nav:['全局总览','智能体管理','任务协同','知识中心','系统监控','告警中心'],
+  nav:['全局总览','智能体管理','任务协同','知识中心','系统监控','告警中心','指挥台'],
   siteTitle:'Multi-Agent 智能体协同平台',
   langBtn:'EN',
   pt:{overview:'全局态势总览',trend:'任务执行趋势',radar:'智能体能力分布',res:'系统资源监控',
@@ -719,7 +762,7 @@ zh:{
            ruleEnabled:'已启用',ruleDisabled:'已禁用'},
 },
 en:{
-  nav:['Overview','Agents','Tasks','Knowledge','Monitor','Alerts'],
+  nav:['Overview','Agents','Tasks','Knowledge','Monitor','Alerts','Command'],
   siteTitle:'Multi-Agent Collaboration Platform',
   langBtn:'中',
   pt:{overview:'Global Overview',trend:'Task Execution Trend',radar:'Agent Capability Radar',res:'System Resources',
@@ -941,6 +984,7 @@ function switchPage(name){
   if(name==='knowledge'){ loadKBs().then(()=>renderKnowledgePage()); }
   if(name==='monitor')   renderMonitorPage();
   if(name==='alerts'){   loadAlerts().then(()=>renderAlertsPage()); }
+  if(name==='command')  renderCommandPage();
 }
 document.querySelectorAll('.nav-btn').forEach(b=>b.addEventListener('click',()=>switchPage(b.dataset.page)));
 
@@ -1110,6 +1154,7 @@ function applyData(data){
   if(active==='tasks')    renderTasksPage();
   if(active==='monitor'){ renderMonitorStatic(data); if(monCharts.cpu)updateMonCharts(data); }
   if(active==='alerts')   renderAlertsPage();
+  updateTokenChart(data);
 }
 
 function renderTop5(agents){
@@ -1728,6 +1773,139 @@ async function doAddRule(){
 }
 function _num(id,val){const el=document.getElementById(id);if(el)el.textContent=String(val);}
 
+// ══ Token Chart ════════════════════════════════════════
+let tokenChart=null;
+function initTokenChart(){
+  const el=document.getElementById('token-chart');if(!el)return;
+  tokenChart=new Chart(el.getContext('2d'),{
+    type:'bar',
+    data:{labels:[],datasets:[
+      {label:'Input Tokens',data:[],backgroundColor:'rgba(42,127,255,.6)'},
+      {label:'Output Tokens',data:[],backgroundColor:'rgba(155,109,255,.6)'},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{labels:{color:'#7ca3d8',font:{size:10}}}},
+      scales:{x:{ticks:{color:'#7ca3d8',font:{size:9}}},y:{ticks:{color:'#7ca3d8'},grid:{color:'rgba(40,130,255,.1)'}}}}
+  });
+}
+
+function updateTokenChart(data){
+  if(!tokenChart)initTokenChart();
+  if(!tokenChart||!data)return;
+  const ts=data.token_stats||{};
+  const names=Object.values(ts).map(a=>a.name);
+  const ins=Object.values(ts).map(a=>a.tokens_in);
+  const outs=Object.values(ts).map(a=>a.tokens_out);
+  tokenChart.data.labels=names;
+  tokenChart.data.datasets[0].data=ins;
+  tokenChart.data.datasets[1].data=outs;
+  tokenChart.update('none');
+}
+
+// ══ Agent Log Stream ══════════════════════════════════
+function addAgentLogEntry(level,message,agent_id){
+  const el=document.getElementById('agent-log-stream');if(!el)return;
+  const colors={error:'var(--red)',warn:'var(--yellow)',info:'var(--green)',debug:'var(--text3)'};
+  const div=document.createElement('div');
+  div.style.cssText=`padding:3px 6px;border-radius:3px;background:rgba(10,20,55,.6);border-left:2px solid ${colors[level]||'var(--text3)'};color:var(--text1);word-break:break-all;`;
+  const ts=new Date().toLocaleTimeString();
+  div.textContent=`[${ts}] [${agent_id||'?'}] ${message}`;
+  el.prepend(div);
+  if(el.children.length>50)el.removeChild(el.lastChild);
+}
+
+// ══ Workflow & Intervention ════════════════════════════
+function renderCommandPage(){
+  updateTokenChart(lastData);
+  renderWorkflows();
+  renderPeers(lastData);
+}
+
+async function renderWorkflows(){
+  // Get all tasks grouped by workflow_id
+  const tasks=lastData?.tasks||[];
+  const wfs={};
+  tasks.forEach(t=>{
+    const wid=t.workflow_id||'';
+    if(!wid)return;
+    if(!wfs[wid])wfs[wid]={id:wid,name:wid,tasks:[],status:'pending'};
+    wfs[wid].tasks.push(t);
+  });
+  // Also try API
+  try{
+    const allTasks=lastData?.tasks||[];
+    const wfTasks=allTasks.filter(t=>t.workflow_id);
+    const wfIds=[...new Set(wfTasks.map(t=>t.workflow_id))];
+    wfIds.forEach(wid=>{
+      if(!wfs[wid])wfs[wid]={id:wid,name:wid,tasks:[],status:'pending'};
+      wfs[wid].tasks=wfTasks.filter(t=>t.workflow_id===wid);
+      const statuses=wfs[wid].tasks.map(t=>t.status);
+      if(statuses.every(s=>s==='completed'))wfs[wid].status='completed';
+      else if(statuses.some(s=>s==='failed'))wfs[wid].status='failed';
+      else if(statuses.some(s=>s==='running'))wfs[wid].status='running';
+    });
+  }catch(_){}
+  const tbody=document.getElementById('wf-tbody');if(!tbody)return;
+  const entries=Object.values(wfs);
+  if(!entries.length){tbody.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--text3);padding:20px;">暂无工作流</td></tr>';return;}
+  const sC={pending:'var(--text3)',running:'var(--green)',completed:'var(--accent2)',paused:'var(--yellow)',failed:'var(--red)'};
+  tbody.innerHTML=entries.map(w=>{
+    const done=w.tasks.filter(t=>t.status==='completed').length;
+    return `<tr>
+      <td style="font-family:monospace;font-size:10px;">${w.id}</td>
+      <td>${w.name}</td>
+      <td><span style="color:${sC[w.status]||'var(--text2)'};">${w.status}</span></td>
+      <td>${done}/${w.tasks.length}</td>
+      <td><button class="btn btn-sm btn-d" onclick="showTaskIntervene('${w.id}')">干预</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function showTaskIntervene(wfId){
+  const tasks=(lastData?.tasks||[]).filter(t=>t.workflow_id===wfId);
+  const el=document.getElementById('task-intervene');
+  if(!el)return;
+  const agents=lastData?.agents||[];
+  const agentOpts=agents.map(a=>`<option value="${a.agent_id}">${a.name}</option>`).join('');
+  el.innerHTML=tasks.map(t=>`<div style="padding:4px;border-bottom:1px solid var(--border);display:flex;gap:4px;align-items:center;">
+    <span style="width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${t.title||t.task_id}</span>
+    <span class="badge ${t.status}">${t.status}</span>
+    ${t.status==='running'?`<button class="btn btn-sm" onclick="apiTaskAction('${t.task_id}','pause')">暂停</button>`:''}
+    ${t.status==='paused'?`<button class="btn btn-sm btn-p" onclick="apiTaskAction('${t.task_id}','resume')">恢复</button>`:''}
+    ${t.status==='failed'?`<button class="btn btn-sm" onclick="apiTaskAction('${t.task_id}','retry')">重试</button>`:''}
+    <select id="reassign-${t.task_id}" style="font-size:9px;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:3px;padding:1px;">
+      <option value="">重新分配...</option>${agentOpts}
+    </select>
+    <button class="btn btn-sm" onclick="reassignTask('${t.task_id}')">指派</button>
+  </div>`).join('');
+}
+
+async function apiTaskAction(taskId,action){
+  try{await fetch(`${API}/api/tasks/${taskId}/${action}`,{method:'POST'});await pollStats();renderCommandPage();}catch(e){}
+}
+async function reassignTask(taskId){
+  const sel=document.getElementById(`reassign-${taskId}`);
+  const aid=sel?.value;if(!aid)return;
+  try{await fetch(`${API}/api/tasks/${taskId}/reassign`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:aid})});await pollStats();renderCommandPage();}catch(e){}
+}
+function showCreateWorkflow(){
+  const title=prompt('工作流名称:');if(!title)return;
+  // Simple workflow: 2 sequential tasks
+  fetch(`${API}/api/workflows`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+    name:title,tasks:[{title:title+' - 步骤1',priority:'P2'},{title:title+' - 步骤2',priority:'P2'}],
+    dependencies:{[title+' - 步骤2']:[title+' - 步骤1']}
+  })}).then(()=>pollStats()).then(()=>renderCommandPage());
+}
+
+function renderPeers(data){
+  const el=document.getElementById('peer-list');if(!el)return;
+  const peers=data?.peers||[];
+  if(!peers.length){el.innerHTML='<span style="color:var(--text3);font-size:10px;">单机模式（无对等节点）</span>';return;}
+  el.innerHTML=peers.map(p=>{
+    const col=p.status==='online'?'var(--green)':'var(--red)';
+    return `<div class="scard" style="min-width:150px;"><div class="slabel">● ${p.node_id}</div><div style="font-size:11px;color:${col};">${p.url}</div><div style="font-size:9px;color:var(--text3);">${p.alias||''}</div></div>`;
+  }).join('');
+}
+
 // ══ WebSocket ══════════════════════════════════════════
 function connectWS(){
   ws=new WebSocket(WS_URL);
@@ -1746,6 +1924,7 @@ function connectWS(){
     const m=JSON.parse(e.data);
     if(m.type==='agent_joined') addSysLog(lang==='zh'?`智能体 ${m.agent_id} 注册上线`:`Agent ${m.agent_id} joined`,'success');
     if(m.type==='task_completed') addSysLog(lang==='zh'?`任务 ${m.task_id} 已完成`:`Task ${m.task_id} completed`,'success');
+    if(m.type==='agent_log') addAgentLogEntry(m.level,m.message,m.agent_id);
     if(m.data) applyData(m.data);
   };
   setInterval(()=>{if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'ping'}));},25000);

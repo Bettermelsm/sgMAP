@@ -7,9 +7,11 @@ Multi-Agent 智能体协同平台 — 后端服务 v2
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import socket
 import sqlite3
 import time
 import uuid
@@ -40,6 +42,13 @@ BROADCAST_INTERVAL = 3   # seconds
 OLLAMA_AUTO_REGISTER = os.getenv("OLLAMA_AUTO_REGISTER", "true").lower() == "true"
 OLLAMA_MODEL_PATTERN = os.getenv("OLLAMA_MODEL_PATTERN", "")
 OLLAMA_SYNC_INTERVAL = int(os.getenv("OLLAMA_SYNC_INTERVAL", "120"))
+SGA_SEED_NODES = [s.strip() for s in os.getenv("SGA_SEED_NODES", "").split(",") if s.strip()]
+SGA_PUBLIC_URL = os.getenv("SGA_PUBLIC_URL", "")
+ORCHESTRATOR_ENABLED = os.getenv("ORCHESTRATOR_ENABLED", "true").lower() == "true"
+ORCHESTRATOR_INTERVAL = int(os.getenv("ORCHESTRATOR_INTERVAL", "5"))
+TASK_STALL_TIMEOUT = int(os.getenv("TASK_STALL_TIMEOUT", "300"))
+DEFAULT_MAX_RETRIES = int(os.getenv("DEFAULT_MAX_RETRIES", "3"))
+THIS_NODE_ID = hashlib.md5((socket.gethostname() + str(uuid.getnode())).encode()).hexdigest()[:4]
 
 # ─── App ─────────────────────────────────────────────────
 app = FastAPI(title="Multi-Agent Platform", version="2.0.0", docs_url="/docs")
@@ -92,7 +101,12 @@ def init_db():
             result_summary TEXT DEFAULT '',
             result_data  TEXT DEFAULT '{}',
             created_at   TEXT,
-            completed_at TEXT
+            completed_at TEXT,
+            depends_on TEXT DEFAULT '[]',
+            workflow_id TEXT DEFAULT '',
+            retry_count INTEGER DEFAULT 0,
+            max_retries INTEGER DEFAULT 3,
+            context_snapshot TEXT DEFAULT '{}'
         );
         CREATE TABLE IF NOT EXISTS events (
             id           TEXT PRIMARY KEY,
@@ -144,6 +158,32 @@ def init_db():
             msg_type     TEXT DEFAULT 'text',
             read         INTEGER DEFAULT 0,
             created_at   TEXT
+        );
+        CREATE TABLE IF NOT EXISTS agent_logs (
+            log_id TEXT PRIMARY KEY,
+            agent_id TEXT NOT NULL,
+            level TEXT DEFAULT 'info',
+            message TEXT,
+            context TEXT DEFAULT '{}',
+            ts REAL
+        );
+        CREATE TABLE IF NOT EXISTS peer_nodes (
+            node_id TEXT PRIMARY KEY,
+            url TEXT NOT NULL,
+            alias TEXT DEFAULT '',
+            status TEXT DEFAULT 'online',
+            last_seen REAL,
+            registered_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS workflows (
+            workflow_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            dag_json TEXT DEFAULT '{}',
+            status TEXT DEFAULT 'pending',
+            created_by TEXT DEFAULT 'user',
+            created_at TEXT,
+            completed_at TEXT
         );
         """)
         db.commit()
@@ -338,6 +378,26 @@ def get_real_resources() -> dict:
         return {"cpu": 42, "memory": 68, "gpu": -1, "storage": 51}
 
 
+def _compute_token_stats(agents: list) -> dict:
+    result = {}
+    for a in agents:
+        m = a.get("metrics", {})
+        if isinstance(m, dict):
+            result[a["agent_id"]] = {
+                "name": a["name"],
+                "tokens_in": m.get("tokens_in", 0),
+                "tokens_out": m.get("tokens_out", 0),
+                "llm_calls": m.get("llm_calls", 0),
+            }
+    return result
+
+def _get_peer_list() -> list:
+    try:
+        rows = db().execute("SELECT * FROM peer_nodes ORDER BY registered_at").fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        return []
+
 def build_stats() -> dict:
     # --- agents ---
     rows = db().execute("SELECT * FROM agents").fetchall()
@@ -371,7 +431,7 @@ def build_stats() -> dict:
     task_rows = db().execute("SELECT * FROM tasks ORDER BY created_at DESC").fetchall()
     tasks = [dict(t) for t in task_rows]
     tp  = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
-    ts2 = {"pending": 0, "running": 0, "completed": 0}
+    ts2 = {"pending": 0, "running": 0, "completed": 0, "paused": 0, "failed": 0}
     for t in tasks:
         tp[t.get("priority", "P2")] = tp.get(t.get("priority", "P2"), 0) + 1
         ts2[t.get("status", "pending")] = ts2.get(t.get("status", "pending"), 0) + 1
@@ -393,6 +453,8 @@ def build_stats() -> dict:
         "data_processed":   round(hot.data_mb / 1000, 2),
         "ws_clients":       len(ws_mgr.clients),
         "capability_scores": _compute_capability_scores(agents),
+        "token_stats": _compute_token_stats(agents),
+        "peers": _get_peer_list(),
     }
 
 
@@ -415,6 +477,10 @@ class TaskCreateReq(BaseModel):
     description: str = ""
     priority:    str = "P2"
     assigned_to: Optional[str] = None
+    depends_on: list[str] = []
+    workflow_id: str = ""
+    max_retries: int = 3
+    context_snapshot: dict = {}
 
 class TaskResultReq(BaseModel):
     summary: str
@@ -449,6 +515,23 @@ class MessageReq(BaseModel):
     to_agent: str
     content:  str
     msg_type: str = "text"
+
+class AgentLogReq(BaseModel):
+    level: str = "info"
+    message: str
+    context: dict = {}
+
+class WorkflowCreateReq(BaseModel):
+    name: str
+    description: str = ""
+    tasks: list[dict] = []
+    dependencies: dict = {}
+
+class TaskContextReq(BaseModel):
+    context_snapshot: dict = {}
+
+class TaskReassignReq(BaseModel):
+    agent_id: str
 
 
 # ══════════════════════════════════════════════════════════
@@ -531,6 +614,16 @@ async def startup():
     if OLLAMA_AUTO_REGISTER:
         await _sync_ollama_models()
         asyncio.create_task(_ollama_sync_loop())
+    # Start Orchestrator
+    if ORCHESTRATOR_ENABLED:
+        from orchestrator import Orchestrator
+        orch = Orchestrator()
+        asyncio.create_task(orch.tick())
+    # Start peer mesh
+    if SGA_SEED_NODES:
+        from peer_mesh import PeerMesh
+        mesh = PeerMesh()
+        asyncio.create_task(mesh.run(THIS_NODE_ID))
 
 
 async def _broadcast_loop():
@@ -705,10 +798,14 @@ async def create_task(req: TaskCreateReq):
     n = now_iso()
     db().execute(
         """INSERT INTO tasks (task_id,title,description,priority,status,
-           assigned_to,result_summary,result_data,created_at)
-           VALUES (?,?,?,?,'pending',?,?,?,?)""",
+           assigned_to,result_summary,result_data,created_at,
+           depends_on,workflow_id,max_retries,context_snapshot)
+           VALUES (?,?,?,?,'pending',?,?,?,?,
+                   ?,?,?,?)""",
         (task_id, req.title, req.description, req.priority,
-         req.assigned_to, "", "{}", n)
+         req.assigned_to, "", "{}", n,
+         json.dumps(req.depends_on), req.workflow_id, req.max_retries,
+         json.dumps(req.context_snapshot))
     )
     db().commit()
     add_event("system", req.assigned_to, f"创建任务: {req.title}", "info", task_id=task_id)
@@ -1118,6 +1215,203 @@ async def get_events(limit: int = Query(30, le=200)):
 @app.get("/api/resources", summary="实时系统资源")
 async def get_resources():
     return get_real_resources()
+
+
+# ── Agent Logs ────────────────────────────────────────────
+@app.post("/api/agents/{agent_id}/log", summary="写入 Agent 日志")
+async def write_agent_log(agent_id: str, req: AgentLogReq):
+    log_id = str(uuid.uuid4())[:8]
+    ts = time.time()
+    db().execute("INSERT INTO agent_logs VALUES (?,?,?,?,?,?)",
+                 (log_id, agent_id, req.level, req.message, json.dumps(req.context), ts))
+    db().commit()
+    await ws_mgr.broadcast({"type": "agent_log", "agent_id": agent_id, "level": req.level, "message": req.message})
+    return {"ok": True, "log_id": log_id}
+
+@app.get("/api/agents/{agent_id}/logs", summary="查询 Agent 日志")
+async def get_agent_logs(agent_id: str, level: str = "", limit: int = 50, offset: int = 0):
+    sql = "SELECT * FROM agent_logs WHERE agent_id=?"
+    params = [agent_id]
+    if level:
+        sql += " AND level=?"
+        params.append(level)
+    sql += " ORDER BY ts DESC LIMIT ? OFFSET ?"
+    params += [limit, offset]
+    rows = db().execute(sql, params).fetchall()
+    return {"logs": [dict(r) for r in rows]}
+
+@app.get("/api/stats/tokens", summary="Token 消耗统计")
+async def get_token_stats():
+    agents = db().execute("SELECT agent_id, name, metrics FROM agents").fetchall()
+    return _compute_token_stats([dict(a) for a in agents])
+
+# ── Peer Nodes ────────────────────────────────────────────
+@app.post("/api/peers/join", summary="节点加入")
+async def peer_join(req: dict):
+    node_id = req.get("node_id", "")
+    url = req.get("url", "")
+    if not node_id or not url:
+        raise HTTPException(400, "node_id and url required")
+    now = now_ts()
+    try:
+        db().execute("INSERT INTO peer_nodes VALUES (?,?,?,?,?,?)",
+                     (node_id, url, req.get("alias", ""), "online", now, now_iso()))
+    except Exception:
+        db().execute("UPDATE peer_nodes SET url=?, last_seen=?, status='online' WHERE node_id=?",
+                     (url, now, node_id))
+    db().commit()
+    add_event("system", None, f"节点 {node_id} 加入", "info")
+    return {"ok": True}
+
+@app.get("/api/peers", summary="列出对等节点")
+async def list_peers():
+    return {"peers": _get_peer_list()}
+
+@app.delete("/api/peers/{node_id}", summary="移除节点")
+async def remove_peer(node_id: str):
+    db().execute("DELETE FROM peer_nodes WHERE node_id=?", (node_id,))
+    db().commit()
+    return {"ok": True}
+
+@app.post("/api/peers/{node_id}/sync", summary="同步对端 Agent")
+async def sync_peer(node_id: str):
+    row = db().execute("SELECT * FROM peer_nodes WHERE node_id=?", (node_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Node not found")
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            resp = await c.get(f"{row['url']}/api/agents")
+            agents = resp.json().get("agents", [])
+        for a in agents:
+            remote_id = f"remote:{node_id}:{a['agent_id']}"
+            caps = a.get("capabilities", []) + ["remote"]
+            try:
+                db().execute("INSERT INTO agents (agent_id,name,role,capabilities,description,status,tasks_completed,last_heartbeat,metrics,registered_at) VALUES (?,?,?,?,?,'idle',0,?,?,?)",
+                             (remote_id, f"[{node_id}] {a['name']}", a.get("role","remote"), json.dumps(caps), "Remote agent", now_ts(), "{}", now_iso()))
+            except Exception:
+                pass
+        db().commit()
+        return {"synced": len(agents)}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.get("/api/knowledge/global", summary="跨节点知识库汇总")
+async def global_knowledge():
+    local = db().execute("SELECT * FROM knowledge_bases").fetchall()
+    result = {"local": [dict(r) for r in local], "remote": []}
+    peers = db().execute("SELECT * FROM peer_nodes WHERE status='online'").fetchall()
+    for p in peers:
+        try:
+            async with httpx.AsyncClient(timeout=5) as c:
+                resp = await c.get(f"{p['url']}/api/knowledge")
+                result["remote"].append({"node_id": p["node_id"], "kbs": resp.json().get("knowledge_bases", [])})
+        except Exception:
+            pass
+    return result
+
+@app.post("/api/knowledge/{kb_id}/broadcast", summary="广播知识库到对等节点")
+async def broadcast_kb(kb_id: str):
+    kb = db().execute("SELECT * FROM knowledge_bases WHERE kb_id=?", (kb_id,)).fetchone()
+    if not kb:
+        raise HTTPException(404, "KB not found")
+    peers = db().execute("SELECT * FROM peer_nodes WHERE status='online'").fetchall()
+    sent = 0
+    for p in peers:
+        try:
+            async with httpx.AsyncClient(timeout=10) as c:
+                await c.post(f"{p['url']}/api/knowledge", json={"name": kb["name"], "type": kb["type"], "description": kb["description"]})
+                sent += 1
+        except Exception:
+            pass
+    return {"sent_to": sent}
+
+# ── Task Intervention ─────────────────────────────────────
+@app.post("/api/tasks/{task_id}/pause", summary="暂停任务")
+async def pause_task(task_id: str):
+    db().execute("UPDATE tasks SET status='paused' WHERE task_id=?", (task_id,))
+    db().commit()
+    add_event("orchestrator", None, f"任务 {task_id} 已暂停", "warning", task_id=task_id)
+    await ws_mgr.broadcast({"type": "task_paused", "task_id": task_id, "data": build_stats()})
+    return {"ok": True}
+
+@app.post("/api/tasks/{task_id}/resume", summary="恢复任务")
+async def resume_task(task_id: str):
+    db().execute("UPDATE tasks SET status='pending' WHERE task_id=?", (task_id,))
+    db().commit()
+    add_event("orchestrator", None, f"任务 {task_id} 已恢复", "info", task_id=task_id)
+    await ws_mgr.broadcast({"type": "task_resumed", "task_id": task_id, "data": build_stats()})
+    return {"ok": True}
+
+@app.post("/api/tasks/{task_id}/retry", summary="重试任务")
+async def retry_task(task_id: str):
+    db().execute("UPDATE tasks SET status='pending', retry_count=retry_count+1 WHERE task_id=?", (task_id,))
+    db().commit()
+    add_event("orchestrator", None, f"任务 {task_id} 重试", "warning", task_id=task_id)
+    await ws_mgr.broadcast({"type": "task_retry", "task_id": task_id, "data": build_stats()})
+    return {"ok": True}
+
+@app.patch("/api/tasks/{task_id}/context", summary="编辑任务上下文")
+async def update_task_context(task_id: str, req: TaskContextReq):
+    db().execute("UPDATE tasks SET context_snapshot=?, status='pending' WHERE task_id=?",
+                 (json.dumps(req.context_snapshot), task_id))
+    db().commit()
+    await ws_mgr.broadcast({"type": "task_context_updated", "task_id": task_id, "data": build_stats()})
+    return {"ok": True}
+
+@app.post("/api/tasks/{task_id}/reassign", summary="重新分配任务")
+async def reassign_task(task_id: str, req: TaskReassignReq):
+    db().execute("UPDATE tasks SET assigned_to=?, status='pending' WHERE task_id=?",
+                 (req.agent_id, task_id))
+    db().commit()
+    add_event("orchestrator", req.agent_id, f"任务 {task_id} 重新分配", "info", task_id=task_id)
+    await ws_mgr.broadcast({"type": "task_reassigned", "task_id": task_id, "data": build_stats()})
+    return {"ok": True}
+
+# ── Workflows ─────────────────────────────────────────────
+@app.post("/api/workflows", summary="创建工作流")
+async def create_workflow(req: WorkflowCreateReq):
+    wf_id = f"wf-{str(uuid.uuid4())[:6]}"
+    task_ids = []
+    for t in req.tasks:
+        tid = f"T-{str(uuid.uuid4())[:6]}"
+        deps = req.dependencies.get(t.get("title", ""), [])
+        db().execute(
+            "INSERT INTO tasks (task_id,title,description,priority,assigned_to,depends_on,workflow_id,max_retries,context_snapshot,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (tid, t.get("title",""), t.get("description",""), t.get("priority","P2"), t.get("assigned_to"),
+             json.dumps(deps), wf_id, t.get("max_retries", DEFAULT_MAX_RETRIES),
+             json.dumps(t.get("context_snapshot",{})), "pending", now_iso()))
+        task_ids.append(tid)
+    dag = {t: req.dependencies.get(t, []) for t in [t_.get("title","") for t_ in req.tasks]}
+    db().execute("INSERT INTO workflows VALUES (?,?,?,?,?,?,?,?)",
+                 (wf_id, req.name, req.description, json.dumps(dag), "pending", "user", now_iso(), ""))
+    db().commit()
+    add_event("system", None, f"工作流 {req.name} 创建 ({len(task_ids)} 个任务)", "info")
+    await ws_mgr.broadcast({"type": "workflow_created", "workflow_id": wf_id, "data": build_stats()})
+    return {"workflow_id": wf_id, "task_ids": task_ids}
+
+@app.get("/api/workflows/{wf_id}", summary="查看工作流")
+async def get_workflow(wf_id: str):
+    wf = db().execute("SELECT * FROM workflows WHERE workflow_id=?", (wf_id,)).fetchone()
+    if not wf:
+        raise HTTPException(404, "Workflow not found")
+    tasks = db().execute("SELECT * FROM tasks WHERE workflow_id=?", (wf_id,)).fetchall()
+    return {"workflow": dict(wf), "tasks": [dict(t) for t in tasks]}
+
+@app.post("/api/workflows/{wf_id}/pause", summary="暂停工作流")
+async def pause_workflow(wf_id: str):
+    db().execute("UPDATE workflows SET status='paused' WHERE workflow_id=?", (wf_id,))
+    db().execute("UPDATE tasks SET status='paused' WHERE workflow_id=? AND status='pending'", (wf_id,))
+    db().commit()
+    await ws_mgr.broadcast({"type": "workflow_paused", "data": build_stats()})
+    return {"ok": True}
+
+@app.post("/api/workflows/{wf_id}/resume", summary="恢复工作流")
+async def resume_workflow(wf_id: str):
+    db().execute("UPDATE workflows SET status='running' WHERE workflow_id=?", (wf_id,))
+    db().execute("UPDATE tasks SET status='pending' WHERE workflow_id=? AND status='paused'", (wf_id,))
+    db().commit()
+    await ws_mgr.broadcast({"type": "workflow_resumed", "data": build_stats()})
+    return {"ok": True}
 
 
 @app.get("/health", summary="健康检查")

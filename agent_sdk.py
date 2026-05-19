@@ -22,11 +22,56 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from typing import Any, AsyncIterator, Callable, Optional
+
+import hashlib
+import socket
+import os
 
 import httpx
 
 log = logging.getLogger("agent_sdk")
+
+
+def _node_fingerprint() -> str:
+    """基于机器标识生成4位前缀，跨机器唯一"""
+    raw = socket.gethostname() + str(uuid.getnode())
+    return hashlib.md5(raw.encode()).hexdigest()[:4]
+
+def _make_agent_id() -> str:
+    fp = _node_fingerprint()
+    short = str(uuid.uuid4())[:6]
+    return f"{fp}:{short}"
+
+
+class AgentMetrics:
+    tokens_in: int = 0
+    tokens_out: int = 0
+    llm_calls: int = 0
+    avg_latency_ms: float = 0
+    tasks_running: int = 0
+    tasks_queued: int = 0
+    errors_count: int = 0
+    proc_cpu_pct: float = 0
+    proc_mem_mb: float = 0
+    model_name: str = ""
+    model_backend: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "llm_calls": self.llm_calls,
+            "avg_latency_ms": self.avg_latency_ms,
+            "tasks_running": self.tasks_running,
+            "tasks_queued": self.tasks_queued,
+            "errors_count": self.errors_count,
+            "proc_cpu_pct": self.proc_cpu_pct,
+            "proc_mem_mb": self.proc_mem_mb,
+            "model_name": self.model_name,
+            "model_backend": self.model_backend,
+        }
 
 
 class AgentClient:
@@ -80,6 +125,9 @@ class AgentClient:
         self._reconnect_count:  int                = 0
         self._http:             Optional[httpx.AsyncClient] = None
 
+        self._metrics = AgentMetrics()
+        self._token_counter = {"input": 0, "output": 0}
+
     # ── Lifecycle ──────────────────────────────────────────────────────
 
     async def register(self) -> str:
@@ -92,6 +140,7 @@ class AgentClient:
                     "role":         self.role,
                     "capabilities": self.capabilities,
                     "description":  self.description,
+                    "agent_id":     _make_agent_id(),
                 },
                 timeout=10,
             )
@@ -265,6 +314,10 @@ class AgentClient:
             )
             resp.raise_for_status()
             answer = resp.json()["response"]
+        # Track token usage (estimate from response length)
+        self._metrics.llm_calls += 1
+        self._metrics.tokens_in += len(prompt.split())
+        self._metrics.tokens_out += len(answer.split())
         if remember:
             self._conversation.append({"role": "user",      "content": prompt})
             self._conversation.append({"role": "assistant", "content": answer})
@@ -407,10 +460,17 @@ class AgentClient:
     async def _heartbeat_loop(self):
         while self._running:
             try:
+                import psutil as _psutil
+                proc = _psutil.Process(os.getpid())
+                self._metrics.proc_cpu_pct = proc.cpu_percent(interval=0.1)
+                self._metrics.proc_mem_mb = proc.memory_info().rss / 1e6
+            except Exception:
+                pass
+            try:
                 async with self._client() as c:
                     await c.post(
                         f"{self.platform_url}/api/agents/{self.agent_id}/heartbeat",
-                        json={"status": self._status, "metrics": {}},
+                        json={"status": self._status, "metrics": self._metrics.to_dict()},
                         timeout=5,
                     )
             except Exception as e:

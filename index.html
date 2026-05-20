@@ -221,7 +221,7 @@ nav{display:flex;gap:2px;}
     <button class="nav-btn" data-page="command">指挥台</button>
   </nav>
   <div class="header-right">
-    <span style="font-size:10px;color:var(--text3);background:rgba(42,127,255,.1);border:1px solid rgba(42,127,255,.2);border-radius:10px;padding:2px 8px;margin-right:6px;">v2.0.0</span>
+    <span style="font-size:10px;color:var(--text3);background:rgba(42,127,255,.1);border:1px solid rgba(42,127,255,.2);border-radius:10px;padding:2px 8px;margin-right:6px;">v3.0.0</span>
     <button class="lang-btn" id="lang-btn" onclick="toggleLang()">EN</button>
     <div><div id="clock">--:--:--</div><div id="clock-date">----</div></div>
     <div class="ws-dot" id="ws-dot"></div>
@@ -684,6 +684,28 @@ nav{display:flex;gap:2px;}
     <div class="ptitle" id="pt-peers">对等节点</div>
     <div id="peer-list" style="display:flex;gap:8px;flex-wrap:wrap;"></div>
   </div>
+
+  <!-- Skills Panel -->
+  <div class="panel" style="margin-top:10px;">
+    <div class="ptitle" id="pt-skills">Skills 管理</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px;">
+      <button class="btn btn-p btn-sm" onclick="syncSkills()" id="btn-sync-skills">同步 GitHub</button>
+      <input id="skill-search" placeholder="搜索 Skill..." style="flex:1;padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg2);color:var(--text1);font-size:11px;">
+    </div>
+    <div id="skills-list" style="display:grid;grid-template-columns:1fr 1fr;gap:6px;"></div>
+  </div>
+
+  <!-- File Manager Panel -->
+  <div class="panel" style="margin-top:10px;">
+    <div class="ptitle" id="pt-files">文件管理</div>
+    <div style="margin-bottom:8px;">
+      <input id="file-task-id" placeholder="Task ID" style="width:120px;padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:var(--bg2);color:var(--text1);font-size:11px;">
+      <button class="btn btn-p btn-sm" onclick="listFiles()">查看文件</button>
+      <input type="file" id="file-upload-input" style="display:none;" onchange="uploadFile()">
+      <button class="btn btn-sm" onclick="document.getElementById('file-upload-input').click()">上传文件</button>
+    </div>
+    <div id="files-list" style="font-size:10px;"></div>
+  </div>
 </div>
 </div>
 
@@ -691,6 +713,12 @@ nav{display:flex;gap:2px;}
 'use strict';
 const API=window.location.protocol==='file:'?'http://localhost:9527':window.location.origin;
 const WS_URL=window.location.protocol==='file:'?'ws://localhost:9527/ws':((window.location.protocol==='https:'?'wss:':'ws:')+'//'+window.location.host+'/ws');
+const _ak=()=>localStorage.getItem('sga_api_key')||'';
+// Check on load
+if(!_ak()&&location.protocol!=='file:'){
+  const k=prompt('请输入 SGA Hub API Key（留空跳过）：');
+  if(k)localStorage.setItem('sga_api_key',k);
+}
 
 // ══ i18n ══════════════════════════════════════════════
 const STRINGS={
@@ -1218,7 +1246,7 @@ function renderAgentsPage(){
   else{const c=document.getElementById('agents-role-chart');if(c)window._arcChart=new Chart(c.getContext('2d'),{type:'doughnut',data:{labels:rl,datasets:[{data:rd.length?rd:[1],backgroundColor:colors,borderWidth:0}]},options:{responsive:false,maintainAspectRatio:false,cutout:'60%',plugins:{legend:{position:'right',labels:{color:'#7ca3d8',font:{size:10},boxWidth:10}}}}});}
 }
 
-async function deregAgent(id){try{await fetch(`${API}/api/agents/${id}`,{method:'DELETE'});await pollStats();}catch(e){}}
+async function deregAgent(id){try{await fetch(`${API}/api/agents/${id}`,{method:'DELETE',headers:{'X-Api-Key':_ak()}});await pollStats();}catch(e){}}
 
 async function doRegisterAgent(){
   const name=document.getElementById('reg-name').value.trim();
@@ -1226,7 +1254,7 @@ async function doRegisterAgent(){
   const caps=document.getElementById('reg-caps').value.split(',').map(s=>s.trim()).filter(Boolean);
   const desc=document.getElementById('reg-desc').value.trim();
   if(!name)return;
-  try{await fetch(`${API}/api/agents/register`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,role,capabilities:caps,description:desc})});
+  try{await fetch(`${API}/api/agents/register`,{method:'POST',headers:{'Content-Type':'application/json','X-Api-Key':_ak()},body:JSON.stringify({name,role,capabilities:caps,description:desc})});
     document.getElementById('reg-modal').style.display='none';await pollStats();renderAgentsPage();}catch(e){}
 }
 
@@ -1264,7 +1292,7 @@ async function doCreateTask(){
   const desc=document.getElementById('ct-desc').value.trim();
   const priority=document.getElementById('ct-priority').value;
   const assigned_to=document.getElementById('ct-agent').value||null;
-  try{await fetch(`${API}/api/tasks`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,description:desc,priority,assigned_to})});
+  try{await fetch(`${API}/api/tasks`,{method:'POST',headers:{'Content-Type':'application/json','X-Api-Key':_ak()},body:JSON.stringify({title,description:desc,priority,assigned_to})});
     document.getElementById('create-task-modal').style.display='none';await pollStats();renderTasksPage();}catch(e){}
 }
 
@@ -1273,7 +1301,8 @@ let KB_BASE=[];
 const KB_ICONS={docs:'📄',vector:'🔬',graph:'🕸️'};
 async function loadKBs(){
   try{
-    const r=await fetch(`${API}/api/knowledge`);
+    const r=await fetch(`${API}/api/knowledge`,{headers:{'X-Api-Key':_ak()}});
+    if(r.status===403){const k=prompt('API Key 无效，请重新输入：');if(k){localStorage.setItem('sga_api_key',k);location.reload();}return;}
     if(!r.ok) return;
     const d=await r.json();
     KB_BASE=(d.knowledge_bases||[]).map(kb=>({
@@ -1369,7 +1398,7 @@ async function syncKb(id){
   const kb=KB_BASE.find(k=>k.id===id);if(!kb||kb.syncing)return;
   kb.syncing=true;renderKnowledgePage();
   try{
-    await fetch(`${API}/api/knowledge/${id}/sync`,{method:'POST'});
+    await fetch(`${API}/api/knowledge/${id}/sync`,{method:'POST',headers:{'X-Api-Key':_ak()}});
   }catch(e){}
   setTimeout(async()=>{
     kb.syncing=false;
@@ -1382,7 +1411,7 @@ async function syncKb(id){
 }
 async function triggerSyncAll(){
   KB_BASE.forEach(kb=>{if(!kb.syncing)kb.syncing=true;});renderKnowledgePage();
-  await Promise.allSettled(KB_BASE.map(kb=>fetch(`${API}/api/knowledge/${kb.id}/sync`,{method:'POST'}).catch(()=>{})));
+  await Promise.allSettled(KB_BASE.map(kb=>fetch(`${API}/api/knowledge/${kb.id}/sync`,{method:'POST',headers:{'X-Api-Key':_ak()}}).catch(()=>{})));
   setTimeout(async()=>{
     await loadKBs();
     const now=new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
@@ -1403,7 +1432,7 @@ function browseKb(id){
 }
 async function deleteKb(id){
   if(!confirm(lang==='zh'?'确认删除该知识库？':'Delete this knowledge base?'))return;
-  try{await fetch(`${API}/api/knowledge/${id}`,{method:'DELETE'});}catch(e){}
+  try{await fetch(`${API}/api/knowledge/${id}`,{method:'DELETE',headers:{'X-Api-Key':_ak()}});}catch(e){}
   if(selKb===id)selKb=null;
   await loadKBs();
 }
@@ -1413,7 +1442,7 @@ async function doAddKb(){
   const type=document.getElementById('akb-type').value;
   const desc=document.getElementById('akb-desc')?.value||'';
   try{
-    const r=await fetch(`${API}/api/knowledge`,{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch(`${API}/api/knowledge`,{method:'POST',headers:{'Content-Type':'application/json','X-Api-Key':_ak()},
       body:JSON.stringify({name,type,description:desc})});
     if(r.ok){
       const d=await r.json();
@@ -1433,7 +1462,7 @@ async function doKbQuery(){
   const kb=KB_BASE.find(k=>k.id===(targetId||selKb))||KB_BASE[0];
   el.innerHTML=`<div style="color:var(--accent2);font-size:10px;">⟳ ${K.searching||'Searching…'}</div>`;
   try{
-    const r=await fetch(`${API}/api/knowledge/query?kb_id=${encodeURIComponent(targetId||'')}&q=${encodeURIComponent(q)}`);
+    const r=await fetch(`${API}/api/knowledge/query?kb_id=${encodeURIComponent(targetId||'')}&q=${encodeURIComponent(q)}`,{headers:{'X-Api-Key':_ak()}});
     const d=await r.json();
     const answer=d.answer||'';
     el.innerHTML=answer.split('\n').filter(Boolean).map((l,i)=>`<div style="padding:4px 0;border-bottom:1px solid var(--border);${i>0?'color:var(--text2);':'color:var(--text1);font-weight:600;'}">${l}</div>`).join('');
@@ -1587,7 +1616,7 @@ async function checkOllamaStatus(){
   if(btn)btn.textContent=M.testing||'Testing…';
   addSysLog(lang==='zh'?'开始检测 Ollama 连接...':'Testing Ollama connection…','info');
   try{
-    const r=await fetch(`${API}/api/models`,{signal:AbortSignal.timeout(5000)});
+    const r=await fetch(`${API}/api/models`,{headers:{'X-Api-Key':_ak()},signal:AbortSignal.timeout(5000)});
     if(r.ok){
       const d=await r.json();
       const models=(d.models||[]).map(m=>m.name||m.model||'?').join(', ')||'none';
@@ -1609,9 +1638,10 @@ let liveAlerts=[];  // from /api/alerts
 async function loadAlerts(){
   try{
     const [rulesR, alertsR] = await Promise.all([
-      fetch(`${API}/api/alerts/rules`),
-      fetch(`${API}/api/alerts?limit=30`),
+      fetch(`${API}/api/alerts/rules`,{headers:{'X-Api-Key':_ak()}}),
+      fetch(`${API}/api/alerts?limit=30`,{headers:{'X-Api-Key':_ak()}}),
     ]);
+    if(rulesR.status===403||alertsR.status===403){const k=prompt('API Key 无效，请重新输入：');if(k){localStorage.setItem('sga_api_key',k);location.reload();}return;}
     if(rulesR.ok){
       const d=await rulesR.json();
       alertRules=(d.rules||[]).map(r=>({
@@ -1730,26 +1760,26 @@ function renderAlertRules(){
 async function dismissAlert(btn){
   const id=btn.dataset.alertId;
   btn.closest('.ai').style.opacity='0.4';btn.disabled=true;btn.textContent='✓';
-  if(id){try{await fetch(`${API}/api/alerts/${id}/acknowledge`,{method:'POST'});}catch(e){}}
+  if(id){try{await fetch(`${API}/api/alerts/${id}/acknowledge`,{method:'POST',headers:{'X-Api-Key':_ak()}});}catch(e){}}
 }
 function markAllRead(){
   document.querySelectorAll('#alert-full .ai').forEach(el=>el.style.opacity='0.4');
-  fetch(`${API}/api/alerts/ack-all`,{method:'POST'}).catch(()=>{});
+  fetch(`${API}/api/alerts/ack-all`,{method:'POST',headers:{'X-Api-Key':_ak()}}).catch(()=>{});
 }
 async function clearAlerts(){
   STRINGS.zh.alerts=[];STRINGS.en.alerts=[];liveAlerts=[];
-  try{await fetch(`${API}/api/alerts`,{method:'DELETE'});}catch(e){}
+  try{await fetch(`${API}/api/alerts`,{method:'DELETE',headers:{'X-Api-Key':_ak()}});}catch(e){}
   renderAlertsPage();renderAlertMini();
 }
 async function toggleRule(id){
   const r=alertRules.find(r=>r.id===id);if(!r)return;
   r.enabled=!r.enabled;
-  try{await fetch(`${API}/api/alerts/rules/${id}?enabled=${r.enabled}`,{method:'PATCH'});}catch(e){}
+  try{await fetch(`${API}/api/alerts/rules/${id}?enabled=${r.enabled}`,{method:'PATCH',headers:{'X-Api-Key':_ak()}});}catch(e){}
   renderAlertRules();
 }
 async function deleteRule(id){
   alertRules=alertRules.filter(r=>r.id!==id);
-  try{await fetch(`${API}/api/alerts/rules/${id}`,{method:'DELETE'});}catch(e){}
+  try{await fetch(`${API}/api/alerts/rules/${id}`,{method:'DELETE',headers:{'X-Api-Key':_ak()}});}catch(e){}
   renderAlertRules();
 }
 function showAddRuleModal(){document.getElementById('add-rule-modal').style.display='flex';}
@@ -1762,7 +1792,7 @@ async function doAddRule(){
     enabled:true};
   try{
     const r=await fetch(`${API}/api/alerts/rules`,{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify(rule)});
+      headers:{'Content-Type':'application/json','X-Api-Key':_ak()},body:JSON.stringify(rule)});
     if(r.ok){const d=await r.json(); alertRules.push({...rule,id:d.rule_id});}
   }catch(e){
     alertRules.push({...rule,id:'r'+Date.now()});
@@ -1818,6 +1848,7 @@ function renderCommandPage(){
   updateTokenChart(lastData);
   renderWorkflows();
   renderPeers(lastData);
+  loadSkills();
 }
 
 async function renderWorkflows(){
@@ -1880,17 +1911,17 @@ async function showTaskIntervene(wfId){
 }
 
 async function apiTaskAction(taskId,action){
-  try{await fetch(`${API}/api/tasks/${taskId}/${action}`,{method:'POST'});await pollStats();renderCommandPage();}catch(e){}
+  try{await fetch(`${API}/api/tasks/${taskId}/${action}`,{method:'POST',headers:{'X-Api-Key':_ak()}});await pollStats();renderCommandPage();}catch(e){}
 }
 async function reassignTask(taskId){
   const sel=document.getElementById(`reassign-${taskId}`);
   const aid=sel?.value;if(!aid)return;
-  try{await fetch(`${API}/api/tasks/${taskId}/reassign`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agent_id:aid})});await pollStats();renderCommandPage();}catch(e){}
+  try{await fetch(`${API}/api/tasks/${taskId}/reassign`,{method:'POST',headers:{'Content-Type':'application/json','X-Api-Key':_ak()},body:JSON.stringify({agent_id:aid})});await pollStats();renderCommandPage();}catch(e){}
 }
 function showCreateWorkflow(){
   const title=prompt('工作流名称:');if(!title)return;
   // Simple workflow: 2 sequential tasks
-  fetch(`${API}/api/workflows`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+  fetch(`${API}/api/workflows`,{method:'POST',headers:{'Content-Type':'application/json','X-Api-Key':_ak()},body:JSON.stringify({
     name:title,tasks:[{title:title+' - 步骤1',priority:'P2'},{title:title+' - 步骤2',priority:'P2'}],
     dependencies:{[title+' - 步骤2']:[title+' - 步骤1']}
   })}).then(()=>pollStats()).then(()=>renderCommandPage());
@@ -1904,6 +1935,94 @@ function renderPeers(data){
     const col=p.status==='online'?'var(--green)':'var(--red)';
     return `<div class="scard" style="min-width:150px;"><div class="slabel">● ${p.node_id}</div><div style="font-size:11px;color:${col};">${p.url}</div><div style="font-size:9px;color:var(--text3);">${p.alias||''}</div></div>`;
   }).join('');
+}
+
+// ══ Skills & File Manager ════════════════════════════════
+async function syncSkills(){
+  try{
+    const r=await fetch(`${API}/api/shared/sync`,{method:'POST',headers:{'X-Api-Key':_ak()}});
+    if(r.status===403){alert('API Key 无效');return;}
+    const d=await r.json();
+    addSysLog(d.ok?`Skills 同步完成 (${d.skill_count||0} 个)`:`同步失败: ${d.message}`);
+    loadSkills();
+  }catch(e){addSysLog('同步失败: '+e);}
+}
+
+async function loadSkills(){
+  try{
+    const r=await fetch(`${API}/api/skills`,{headers:{'X-Api-Key':_ak()}});
+    if(!r.ok)return;
+    const d=await r.json();
+    const el=document.getElementById('skills-list');
+    if(!el)return;
+    el.innerHTML=(d.skills||[]).map(s=>`
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:4px;padding:6px 8px;cursor:pointer;" onclick="viewSkill('${s.name}')">
+        <div style="color:var(--accent2);font-weight:600;font-size:11px;">${s.name}</div>
+        <div style="color:var(--text3);font-size:9px;margin-top:2px;">${s.description||''}</div>
+      </div>
+    `).join('')||'<div style="color:var(--text3);">暂无 Skills，点击"同步 GitHub"拉取</div>';
+  }catch(e){}
+}
+
+async function viewSkill(name){
+  try{
+    const r=await fetch(`${API}/api/skills/${name}`,{headers:{'X-Api-Key':_ak()}});
+    if(!r.ok)return;
+    const d=await r.json();
+    const content=d.content||'';
+    // Show in a simple modal
+    const modal=document.createElement('div');
+    modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:flex;align-items:center;justify-content:center;';
+    modal.innerHTML=`<div style="background:var(--bg2);border:1px solid var(--border2);border-radius:8px;padding:16px;max-width:600px;max-height:80vh;overflow-y:auto;width:90%;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <span style="color:var(--accent2);font-weight:600;">${name}</span>
+        <button onclick="this.closest('div[style]').parentElement.remove()" style="background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;">✕</button>
+      </div>
+      <pre style="white-space:pre-wrap;font-size:11px;color:var(--text1);line-height:1.5;">${content.replace(/</g,'&lt;')}</pre>
+    </div>`;
+    document.body.appendChild(modal);
+  }catch(e){}
+}
+
+async function listFiles(){
+  const taskId=document.getElementById('file-task-id').value.trim();
+  if(!taskId)return;
+  try{
+    const r=await fetch(`${API}/api/files/${taskId}`,{headers:{'X-Api-Key':_ak()}});
+    if(!r.ok)return;
+    const d=await r.json();
+    const el=document.getElementById('files-list');
+    el.innerHTML=(d.files||[]).map(f=>`
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid var(--border);">
+        <span style="color:var(--accent2);">${f.filename}</span>
+        <span style="color:var(--text3);">${(f.size_bytes/1024).toFixed(1)}KB</span>
+        <a href="${API}${f.download_url}" style="color:var(--green);font-size:10px;text-decoration:none;" download>下载</a>
+      </div>
+    `).join('')||'<span style="color:var(--text3);">无文件</span>';
+  }catch(e){}
+}
+
+async function uploadFile(){
+  const taskId=document.getElementById('file-task-id').value.trim();
+  if(!taskId){alert('请先输入 Task ID');return;}
+  const input=document.getElementById('file-upload-input');
+  const file=input.files[0];
+  if(!file)return;
+  const fd=new FormData();
+  fd.append('file',file);
+  try{
+    const headers={'X-Api-Key':_ak()};
+    const r=await fetch(`${API}/api/files/upload?task_id=${taskId}&agent_id=dashboard`,{
+      method:'POST',headers,body:fd
+    });
+    if(r.ok){
+      addSysLog(`文件 ${file.name} 上传成功`);
+      listFiles();
+    }else{
+      addSysLog(`上传失败: ${r.status}`);
+    }
+  }catch(e){addSysLog('上传失败: '+e);}
+  input.value='';
 }
 
 // ══ WebSocket ══════════════════════════════════════════
@@ -1929,7 +2048,7 @@ function connectWS(){
   };
   setInterval(()=>{if(ws.readyState===WebSocket.OPEN)ws.send(JSON.stringify({type:'ping'}));},25000);
 }
-async function pollStats(){try{const r=await fetch(`${API}/api/stats`);if(r.ok)applyData(await r.json());}catch(_){}}
+async function pollStats(){try{const r=await fetch(`${API}/api/stats`,{headers:{'X-Api-Key':_ak()}});if(r.ok){applyData(await r.json());}else if(r.status===403){const k=prompt('API Key 无效，请重新输入：');if(k){localStorage.setItem('sga_api_key',k);location.reload();}}}catch(_){}}
 
 connectWS();setInterval(pollStats,10000);pollStats();
 renderAlertMini();

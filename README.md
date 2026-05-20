@@ -1,20 +1,34 @@
 > 🌐 **中文** &nbsp;|&nbsp; [English](./README_EN.md)
 
-# Multi-Agent 智能体协同平台 v2.0.0
+# Multi-Agent 智能体协同平台 v3.0.0 — Cloud Hub
 
-基于 Hermes (Ollama) 的多智能体统一管理平台，带实时看板、DAG 任务调度与多机互联。
+基于 Hermes (Ollama) 的多智能体统一管理平台。支持云端部署、API 鉴权、多机 Agent 接入、GitHub 知识库同步、文件中转与多 Agent 协同任务。
 
 ## 架构
 
 ```
-前端看板 (index.html)
-  7 页导航 · WebSocket 实时推送 · Chart.js · 指挥台页面 · 中英文切换
-        ↕ WS / REST
-FastAPI 后端 (main.py)
-  SQLite 持久化 · 50+ API 端点 · DAG 调度引擎 · 多节点互联 · 流式 LLM
-        ↕ HTTP
-Ollama / Hermes          你的智能体 (agent_sdk.py)
-  本地 LLM 推理          注册 · 心跳 · 任务 · 多轮对话 · 工具调用
+┌─────────────────────────────────────────────────────┐
+│              用户 / 管理员（浏览器看板）               │
+└─────────────────────────┬───────────────────────────┘
+                          │ HTTPS + WS
+┌─────────────────────────▼───────────────────────────┐
+│                云端 SGA Hub (main.py)                 │
+│  鉴权 · 注册 · DAG调度 · 文件中转 · GitHub同步       │
+└──┬──────────────────┬──────────────────┬─────────────┘
+   │                  │                  │
+   ▼                  ▼                  ▼
+机器 A              机器 B              机器 C
+agent_sdk           agent_sdk          agent_sdk
+Coder Agent         GPU Agent          Writer Agent
+Ollama              vLLM               Claude API
+   │                  │                  │
+   └──────────────────┼──────────────────┘
+                      │ Git
+              ┌───────▼────────┐
+              │ GitHub 共享仓库 │
+              │ knowledge/     │
+              │ skills/        │
+              └────────────────┘
 ```
 
 ## 快速开始
@@ -23,34 +37,33 @@ Ollama / Hermes          你的智能体 (agent_sdk.py)
 # 1. 安装依赖
 pip install fastapi uvicorn httpx python-multipart psutil aiofiles
 
-# 2. 启动平台
+# 2. 启动 Hub
 uvicorn main:app --reload --port 9527
 
-# 3. 打开浏览器
-# http://localhost:9527
+# 3. 打开浏览器 → http://localhost:9527
 
-# 4. 启动演示智能体（另一个终端）
+# 4. 启动 Agent（另一个终端）
 python demo_agents.py
 ```
 
-## v2.0.0 新增功能
+## v3.0.0 新增功能
 
 | 模块 | 新增 |
 |------|------|
-| 调度中枢 | DAG 任务依赖编排，自动按序执行 |
-| 调度中枢 | 基于能力的智能体-任务匹配（贪心策略）|
-| 调度中枢 | 超时检测与自动重试 |
-| 调度中枢 | 任务干预：暂停/恢复/重试/重分配/编辑上下文 |
-| 工作流 | 工作流 CRUD + 批量暂停/恢复 |
-| 多机互联 | 节点发现与自动宣告 |
-| 多机互联 | 跨节点 Agent 同步 |
-| 多机互联 | 知识库广播到对等节点 |
-| 看板 | Token 消耗统计柱状图 |
-| 看板 | 实时 Agent 日志流（WebSocket 驱动）|
-| 看板 | 指挥台页面：工作流管理 + 任务干预 + 节点监控 |
-| SDK | 跨机器唯一 Agent ID（节点指纹 + UUID）|
-| SDK | AgentMetrics 标准指标（Token/CPU/内存）|
-| SDK | 心跳自动采集进程资源 |
+| **鉴权** | API Key 鉴权中间件，所有 /api/ 路由受保护 |
+| **鉴权** | 前端自动提示输入 Key，localStorage 持久化 |
+| **文件中转** | 文件上传/下载 API（multipart，500MB 上限）|
+| **文件中转** | Agent SDK 支持 upload_file / download_file |
+| **Skills** | GitHub 共享仓库 Skills 同步到本地数据库 |
+| **Skills** | Skills 列表/查询/内容获取 API |
+| **Skills** | Agent SDK 支持 get_skill / list_skills |
+| **GitHub 同步** | git clone/pull/push 自动化 |
+| **GitHub 同步** | Webhook 自动触发同步 |
+| **调度增强** | Orchestrator 工作流完成/失败状态追踪 |
+| **调度增强** | 上游任务失败自动取消下游依赖 |
+| **调度增强** | required_capabilities 精确匹配 |
+| **多机接入** | Agent SDK 支持 SGA_HUB_URL 远程连接 |
+| **多机接入** | 所有请求自动附带鉴权头 |
 
 ## API 速查
 
@@ -74,10 +87,22 @@ PATCH /api/tasks/{id}/context          编辑上下文
 POST /api/tasks/{id}/reassign          重新分配
 
 # 工作流
-POST /api/workflows                    创建工作流
-GET  /api/workflows/{id}               查看工作流
+POST /api/workflows                    创建工作流（支持 $N 依赖引用）
+GET  /api/workflows/{id}               查看工作流（含进度）
 POST /api/workflows/{id}/pause         暂停工作流
 POST /api/workflows/{id}/resume        恢复工作流
+
+# 文件中转
+POST /api/files/upload                 上传文件（multipart）
+GET  /api/files/{task_id}/{filename}   下载文件
+GET  /api/files/{task_id}              列出任务文件
+DELETE /api/files/{task_id}/{filename} 删除文件
+
+# Skills
+POST /api/shared/sync                  同步 GitHub 仓库
+POST /api/shared/push                  推送到 GitHub
+GET  /api/skills                       列出 Skills
+GET  /api/skills/{name}                获取 Skill 内容
 
 # 节点
 POST /api/peers/join                   节点加入
@@ -97,8 +122,9 @@ POST /api/knowledge                    创建知识库
 GET  /api/knowledge/global             跨节点知识库汇总
 POST /api/knowledge/{id}/broadcast     广播到对等节点
 
-# LLM / 其他
+# LLM / Webhook / 其他
 POST /api/chat                         LLM 推理（支持流式）
+POST /api/github/webhook               GitHub Webhook
 GET  /api/models                       列出 Ollama 模型
 GET  /health                           健康检查
 WS   /ws                               实时推送
@@ -110,35 +136,31 @@ GET  /docs                             Swagger UI
 ```python
 from agent_sdk import AgentClient, PlannerAgent, CoderAgent, AnalystAgent
 
-agent = AgentClient(name="我的智能体", role="analyzer")
+# 连接远程 Hub
+agent = AgentClient(name="我的智能体", role="analyzer",
+                    platform_url="https://your-hub:9527")
 await agent.register()
 
-# 创建带依赖的任务
-t1 = await agent.create_task("数据采集", priority="P1")
-t2 = await agent.create_task("数据分析", priority="P2")
-# t2 会在 t1 完成后自动被调度器分配
+# 文件操作
+await agent.upload_file(task_id, "/path/to/result.md")
+await agent.download_file(task_id, "input.csv", "/tmp/input.csv")
+files = await agent.list_task_files(task_id)
 
-# 单次 LLM
+# Skills
+skills = await agent.list_skills()
+skill_content = await agent.get_skill("code_review")
+
+# 任务 + LLM
 answer = await agent.llm("分析这段数据...")
-
-# 多轮对话
-await agent.llm("问题1", remember=True)
-await agent.llm("追问", remember=True)
-agent.clear_history()
-
-# 流式输出
 async for token in agent.llm_stream("生成报告..."):
     print(token, end="", flush=True)
-
-# 消息
-await agent.send_message(other_agent_id, "请协助处理任务")
-msgs = await agent.get_inbox()
 ```
 
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `SGA_API_KEY` | 空（无鉴权） | API 鉴权密钥 |
 | `OLLAMA_BASE` | `http://localhost:11434` | Ollama 地址 |
 | `HERMES_MODEL` | `hermes3` | 默认 LLM 模型 |
 | `HB_TIMEOUT` | `60` | 心跳超时（秒）|
@@ -146,5 +168,30 @@ msgs = await agent.get_inbox()
 | `ORCHESTRATOR_INTERVAL` | `5` | 调度轮询间隔（秒）|
 | `TASK_STALL_TIMEOUT` | `300` | 任务超时判定（秒）|
 | `DEFAULT_MAX_RETRIES` | `3` | 默认最大重试次数 |
+| `SGA_SHARED_REPO` | `` | GitHub 共享仓库 URL |
+| `SGA_SHARED_DIR` | `./shared` | 本地共享目录 |
+| `SGA_FILES_DIR` | `./task_files` | 文件存储目录 |
+| `GITHUB_WEBHOOK_SECRET` | `` | Webhook 签名密钥 |
+| `MAX_UPLOAD_SIZE_MB` | `500` | 最大上传文件（MB）|
 | `SGA_SEED_NODES` | `` | 种子节点列表（逗号分隔）|
 | `SGA_PUBLIC_URL` | `` | 本节点公网 URL |
+
+## 项目结构
+
+```
+├── main.py              # Hub 主服务（FastAPI）
+├── orchestrator.py      # DAG 任务调度引擎
+├── peer_mesh.py         # 多节点互联模块
+├── agent_sdk.py         # Agent SDK（Python）
+├── index.html           # 看板前端
+├── demo_agents.py       # 演示 Agent 脚本
+├── start.sh             # 一键启动脚本
+├── config/
+│   ├── hub.env          # Hub 端配置模板
+│   └── agent.env        # Agent 端配置模板
+├── scripts/
+│   ├── start_hub.sh     # 云端 Hub 启动
+│   └── start_agent.sh   # 本地 Agent 启动
+└── docs/
+    └── QUICKSTART.md    # 5 分钟快速上手
+```

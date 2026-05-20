@@ -1,20 +1,34 @@
 > 🌐 [中文](./README.md) &nbsp;|&nbsp; **English**
 
-# Multi-Agent Collaborative Platform v2.0.0
+# Multi-Agent Collaborative Platform v3.0.0 — Cloud Hub
 
-A unified multi-agent management platform based on Hermes (Ollama), featuring real-time dashboard, DAG task scheduling, and multi-node networking.
+A unified multi-agent management platform based on Hermes (Ollama). Supports cloud deployment, API authentication, multi-machine agent registration, GitHub knowledge sync, file relay, and multi-agent collaborative tasks.
 
 ## Architecture
 
 ```
-Frontend Dashboard (index.html)
-  7-page navigation · WebSocket real-time push · Chart.js · Command Center · i18n (ZH/EN)
-        ↕ WS / REST
-FastAPI Backend (main.py)
-  SQLite persistence · 50+ API endpoints · DAG scheduler · Multi-node mesh · Streaming LLM
-        ↕ HTTP
-Ollama / Hermes          Your Agents (agent_sdk.py)
-  Local LLM inference    Register · Heartbeat · Tasks · Multi-turn chat · Tool calls
+┌─────────────────────────────────────────────────────┐
+│              User / Admin (Browser Dashboard)         │
+└─────────────────────────┬───────────────────────────┘
+                          │ HTTPS + WS
+┌─────────────────────────▼───────────────────────────┐
+│                Cloud SGA Hub (main.py)                │
+│  Auth · Registry · DAG Scheduler · File Store · Git  │
+└──┬──────────────────┬──────────────────┬─────────────┘
+   │                  │                  │
+   ▼                  ▼                  ▼
+Machine A           Machine B          Machine C
+agent_sdk           agent_sdk          agent_sdk
+Coder Agent         GPU Agent          Writer Agent
+Ollama              vLLM               Claude API
+   │                  │                  │
+   └──────────────────┼──────────────────┘
+                      │ Git
+              ┌───────▼────────┐
+              │ GitHub Shared   │
+              │ knowledge/     │
+              │ skills/        │
+              └────────────────┘
 ```
 
 ## Quick Start
@@ -23,34 +37,33 @@ Ollama / Hermes          Your Agents (agent_sdk.py)
 # 1. Install dependencies
 pip install fastapi uvicorn httpx python-multipart psutil aiofiles
 
-# 2. Start the platform
+# 2. Start Hub
 uvicorn main:app --reload --port 9527
 
-# 3. Open browser
-# http://localhost:9527
+# 3. Open browser → http://localhost:9527
 
-# 4. Start demo agents (another terminal)
+# 4. Start agents (another terminal)
 python demo_agents.py
 ```
 
-## What's New in v2.0.0
+## What's New in v3.0.0
 
 | Module | Feature |
 |--------|---------|
-| Orchestrator | DAG-based task dependency scheduling, automatic sequential execution |
-| Orchestrator | Capability-based agent-task matching (greedy strategy) |
-| Orchestrator | Timeout detection with automatic retry |
-| Orchestrator | Task intervention: pause / resume / retry / reassign / edit context |
-| Workflows | Workflow CRUD + batch pause / resume |
-| Multi-node | Node discovery and auto-announce |
-| Multi-node | Cross-node agent sync |
-| Multi-node | Knowledge base broadcast to peer nodes |
-| Dashboard | Token consumption bar chart |
-| Dashboard | Real-time agent log stream (WebSocket-driven) |
-| Dashboard | Command Center page: workflow management + task intervention + node monitoring |
-| SDK | Cross-machine unique Agent ID (node fingerprint + UUID) |
-| SDK | Standard AgentMetrics (Token / CPU / Memory) |
-| SDK | Auto-collect process resources in heartbeat |
+| **Auth** | API Key authentication middleware, all /api/ routes protected |
+| **Auth** | Frontend auto-prompts for Key, localStorage persistence |
+| **File Transfer** | File upload/download API (multipart, 500MB limit) |
+| **File Transfer** | Agent SDK supports upload_file / download_file |
+| **Skills** | GitHub shared repo Skills sync to local database |
+| **Skills** | Skills list/query/content API |
+| **Skills** | Agent SDK supports get_skill / list_skills |
+| **GitHub Sync** | Automated git clone/pull/push |
+| **GitHub Sync** | Webhook auto-triggers sync |
+| **Scheduler** | Orchestrator workflow completion/failure tracking |
+| **Scheduler** | Upstream failure auto-cancels downstream dependencies |
+| **Scheduler** | required_capabilities precise matching |
+| **Multi-machine** | Agent SDK supports SGA_HUB_URL remote connection |
+| **Multi-machine** | All requests auto-attach auth headers |
 
 ## API Reference
 
@@ -74,10 +87,22 @@ PATCH /api/tasks/{id}/context          Edit context
 POST /api/tasks/{id}/reassign          Reassign
 
 # Workflows
-POST /api/workflows                    Create workflow
-GET  /api/workflows/{id}               View workflow
+POST /api/workflows                    Create workflow (supports $N refs)
+GET  /api/workflows/{id}               View workflow (with progress)
 POST /api/workflows/{id}/pause         Pause workflow
 POST /api/workflows/{id}/resume        Resume workflow
+
+# File Transfer
+POST /api/files/upload                 Upload file (multipart)
+GET  /api/files/{task_id}/{filename}   Download file
+GET  /api/files/{task_id}              List task files
+DELETE /api/files/{task_id}/{filename} Delete file
+
+# Skills
+POST /api/shared/sync                  Sync GitHub repo
+POST /api/shared/push                  Push to GitHub
+GET  /api/skills                       List Skills
+GET  /api/skills/{name}                Get Skill content
 
 # Peers
 POST /api/peers/join                   Node join
@@ -97,8 +122,9 @@ POST /api/knowledge                    Create knowledge base
 GET  /api/knowledge/global             Cross-node KB summary
 POST /api/knowledge/{id}/broadcast     Broadcast to peers
 
-# LLM / Misc
+# LLM / Webhook / Misc
 POST /api/chat                         LLM inference (supports streaming)
+POST /api/github/webhook               GitHub Webhook
 GET  /api/models                       List Ollama models
 GET  /health                           Health check
 WS   /ws                               Real-time push
@@ -110,41 +136,62 @@ GET  /docs                             Swagger UI
 ```python
 from agent_sdk import AgentClient, PlannerAgent, CoderAgent, AnalystAgent
 
-agent = AgentClient(name="My Agent", role="analyzer")
+# Connect to remote Hub
+agent = AgentClient(name="My Agent", role="analyzer",
+                    platform_url="https://your-hub:9527")
 await agent.register()
 
-# Create tasks with dependencies
-t1 = await agent.create_task("Data collection", priority="P1")
-t2 = await agent.create_task("Data analysis", priority="P2")
-# t2 will be auto-assigned by the orchestrator after t1 completes
+# File operations
+await agent.upload_file(task_id, "/path/to/result.md")
+await agent.download_file(task_id, "input.csv", "/tmp/input.csv")
+files = await agent.list_task_files(task_id)
 
-# Single-shot LLM
+# Skills
+skills = await agent.list_skills()
+skill_content = await agent.get_skill("code_review")
+
+# Tasks + LLM
 answer = await agent.llm("Analyze this data...")
-
-# Multi-turn conversation
-await agent.llm("Question 1", remember=True)
-await agent.llm("Follow-up question", remember=True)
-agent.clear_history()
-
-# Streaming output
 async for token in agent.llm_stream("Generate a report..."):
     print(token, end="", flush=True)
-
-# Messaging
-await agent.send_message(other_agent_id, "Please help with this task")
-msgs = await agent.get_inbox()
 ```
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `SGA_API_KEY` | empty (no auth) | API authentication key |
 | `OLLAMA_BASE` | `http://localhost:11434` | Ollama URL |
 | `HERMES_MODEL` | `hermes3` | Default LLM model |
 | `HB_TIMEOUT` | `60` | Heartbeat timeout (seconds) |
-| `ORCHESTRATOR_ENABLED` | `true` | Enable scheduling engine |
+| `ORCHESTRATOR_ENABLED` | `true` | Enable scheduler |
 | `ORCHESTRATOR_INTERVAL` | `5` | Scheduler tick interval (seconds) |
 | `TASK_STALL_TIMEOUT` | `300` | Task timeout threshold (seconds) |
 | `DEFAULT_MAX_RETRIES` | `3` | Default max retry count |
+| `SGA_SHARED_REPO` | `` | GitHub shared repo URL |
+| `SGA_SHARED_DIR` | `./shared` | Local shared directory |
+| `SGA_FILES_DIR` | `./task_files` | File storage directory |
+| `GITHUB_WEBHOOK_SECRET` | `` | Webhook signing secret |
+| `MAX_UPLOAD_SIZE_MB` | `500` | Max upload file size (MB) |
 | `SGA_SEED_NODES` | `` | Seed nodes (comma-separated) |
 | `SGA_PUBLIC_URL` | `` | This node's public URL |
+
+## Project Structure
+
+```
+├── main.py              # Hub service (FastAPI)
+├── orchestrator.py      # DAG task scheduler
+├── peer_mesh.py         # Multi-node mesh
+├── agent_sdk.py         # Agent SDK (Python)
+├── index.html           # Dashboard frontend
+├── demo_agents.py       # Demo agent script
+├── start.sh             # One-click startup
+├── config/
+│   ├── hub.env          # Hub config template
+│   └── agent.env        # Agent config template
+├── scripts/
+│   ├── start_hub.sh     # Cloud Hub startup
+│   └── start_agent.sh   # Local Agent startup
+└── docs/
+    └── QUICKSTART.md    # 5-minute quickstart
+```

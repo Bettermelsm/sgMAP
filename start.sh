@@ -2,13 +2,11 @@
 # Multi-Agent Platform v2 — 一键启动脚本 (macOS / Linux)
 set -e
 
-PLATFORM_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BACKEND_DIR="$PLATFORM_DIR/backend"
-SDK_DIR="$PLATFORM_DIR/sdk"
+PLATFORM_DIR="$(cd "$(dirname "$0")" && pwd)"
 PORT=${PORT:-9527}
 
 echo "╔══════════════════════════════════════════════╗"
-echo "║  Multi-Agent 智能体协同平台 v2  启动脚本      ║"
+echo "║  Multi-Agent 智能体协同平台 v3  启动脚本      ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
 
@@ -41,12 +39,12 @@ if [ ! -d "$PLATFORM_DIR/.venv" ]; then
   python3 -m venv "$PLATFORM_DIR/.venv"
 fi
 source "$PLATFORM_DIR/.venv/bin/activate"
-pip install -q -r "$BACKEND_DIR/requirements.txt"
+pip install -q fastapi uvicorn httpx python-multipart psutil aiofiles
 echo "  ✓ Python 依赖就绪"
 
 # ── 4. Start backend ─────────────────────────────────────
 echo "▸ 启动 FastAPI 后端 (port $PORT)..."
-cd "$BACKEND_DIR"
+cd "$PLATFORM_DIR"
 HERMES_MODEL="$HERMES_MODEL" uvicorn main:app \
   --host 0.0.0.0 --port "$PORT" \
   --reload --log-level info &
@@ -78,9 +76,9 @@ echo "║                                              ║"
 echo "║  看板:    http://localhost:$PORT              ║"
 echo "║  API:     http://localhost:$PORT/docs          ║"
 echo "║  WS:      ws://localhost:$PORT/ws              ║"
-echo "║  DB:      $BACKEND_DIR/platform.db           ║"
+echo "║  DB:      $PLATFORM_DIR/platform.db           ║"
 echo "║                                              ║"
-echo "║  运行演示: python scripts/demo_agents.py      ║"
+echo "║  运行演示: python demo_agents.py              ║"
 echo "║  按 Ctrl+C 停止                               ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""

@@ -8,11 +8,13 @@ Multi-Agent 智能体协同平台 — 后端服务 v2
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
 import socket
 import sqlite3
+import subprocess
 import time
 import uuid
 from collections import deque
@@ -21,11 +23,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
+import aiofiles
 import httpx
+import mimetypes
 import psutil
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -50,9 +55,28 @@ TASK_STALL_TIMEOUT = int(os.getenv("TASK_STALL_TIMEOUT", "300"))
 DEFAULT_MAX_RETRIES = int(os.getenv("DEFAULT_MAX_RETRIES", "3"))
 THIS_NODE_ID = hashlib.md5((socket.gethostname() + str(uuid.getnode())).encode()).hexdigest()[:4]
 
+# ─── Cloud Hub Config ────────────────────────────────────
+SGA_API_KEY = os.getenv("SGA_API_KEY", "")
+SHARED_REPO_URL = os.getenv("SGA_SHARED_REPO", "")
+SHARED_DIR = Path(os.getenv("SGA_SHARED_DIR", "./shared"))
+FILES_DIR = Path(os.getenv("SGA_FILES_DIR", "./task_files"))
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500")) * 1024 * 1024
+
 # ─── App ─────────────────────────────────────────────────
-app = FastAPI(title="Multi-Agent Platform", version="2.0.0", docs_url="/docs")
+app = FastAPI(title="Multi-Agent Platform", version="3.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ─── Auth ────────────────────────────────────────────────
+api_key_header = APIKeyHeader(name="X-Api-Key", auto_error=False)
+
+async def require_auth(key: str = Depends(api_key_header)):
+    if SGA_API_KEY and key != SGA_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+# ─── Directory init ──────────────────────────────────────
+SHARED_DIR.mkdir(parents=True, exist_ok=True)
+FILES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─── Serve frontend ──────────────────────────────────────
 FRONTEND_DIR = Path(os.getenv("FRONTEND_DIR", "."))
@@ -185,6 +209,35 @@ def init_db():
             created_at TEXT,
             completed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS task_files (
+            file_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            uploader TEXT NOT NULL,
+            size_bytes INTEGER DEFAULT 0,
+            md5 TEXT DEFAULT '',
+            mime_type TEXT DEFAULT '',
+            download_url TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS skills (
+            skill_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            filename TEXT NOT NULL,
+            content TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            tags TEXT DEFAULT '[]',
+            source TEXT DEFAULT 'github',
+            synced_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sync_history (
+            sync_id TEXT PRIMARY KEY,
+            sync_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            files_changed INTEGER DEFAULT 0,
+            message TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """)
         db.commit()
         # Seed default KB and alert rules if empty
@@ -192,6 +245,14 @@ def init_db():
             _seed_knowledge_bases(db)
         if not db.execute("SELECT 1 FROM alert_rules LIMIT 1").fetchone():
             _seed_alert_rules(db)
+        # ── Migrate: add columns for v3.0.0 ──
+        for col, definition in [
+            ("output_files", "TEXT DEFAULT '[]'"),
+        ]:
+            try:
+                db.execute(f"ALTER TABLE tasks ADD COLUMN {col} {definition}")
+            except Exception:
+                pass
 
 
 def _seed_knowledge_bases(db):
@@ -608,7 +669,7 @@ async def startup():
     for row in db().execute("SELECT agent_id, status, last_heartbeat FROM agents").fetchall():
         hot.agent_status[row["agent_id"]] = row["status"]
         hot.agent_hb[row["agent_id"]]     = row["last_heartbeat"] or now_ts()
-    log.info(f"Platform v2 started. DB={DB_PATH}, {len(hot.agent_status)} agents restored.")
+    log.info(f"Platform v3 started. DB={DB_PATH}, {len(hot.agent_status)} agents restored.")
     asyncio.create_task(_broadcast_loop())
     asyncio.create_task(_alert_check_loop())
     if OLLAMA_AUTO_REGISTER:
@@ -670,9 +731,66 @@ async def _alert_check_loop():
 
 
 # ══════════════════════════════════════════════════════════
+#  GitHub sync internals
+# ══════════════════════════════════════════════════════════
+def _git_sync_pull() -> dict:
+    """从 GitHub 拉取最新知识库和 Skills"""
+    if not SHARED_REPO_URL:
+        return {"ok": False, "message": "未配置 SGA_SHARED_REPO"}
+    try:
+        if not (SHARED_DIR / ".git").exists():
+            subprocess.run(["git", "clone", SHARED_REPO_URL, str(SHARED_DIR)],
+                           check=True, capture_output=True, text=True)
+        else:
+            subprocess.run(["git", "-C", str(SHARED_DIR), "pull"],
+                           check=True, capture_output=True, text=True)
+        return {"ok": True}
+    except subprocess.CalledProcessError as e:
+        return {"ok": False, "message": e.stderr or str(e)}
+
+def _git_sync_push(message: str = "Auto-sync from SGA Hub") -> dict:
+    try:
+        subprocess.run(["git", "-C", str(SHARED_DIR), "add", "-A"],
+                       check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["git", "-C", str(SHARED_DIR), "commit", "-m", message],
+            capture_output=True, text=True)
+        if "nothing to commit" in result.stdout:
+            return {"ok": True, "message": "无变更需要推送"}
+        subprocess.run(["git", "-C", str(SHARED_DIR), "push"],
+                       check=True, capture_output=True, text=True)
+        return {"ok": True, "message": "推送成功"}
+    except subprocess.CalledProcessError as e:
+        return {"ok": False, "message": e.stderr or str(e)}
+
+def _index_skills_to_db():
+    skills_dir = SHARED_DIR / "skills"
+    if not skills_dir.exists():
+        return 0
+    count = 0
+    for f in skills_dir.glob("*.md"):
+        if f.name.startswith("_"):
+            continue
+        content = f.read_text(encoding="utf-8")
+        description = ""
+        for line in content.splitlines():
+            line = line.strip().lstrip("#").strip()
+            if line:
+                description = line[:100]
+                break
+        db().execute("""INSERT OR REPLACE INTO skills
+            (skill_id, name, filename, content, description, source, synced_at)
+            VALUES (?, ?, ?, ?, ?, 'github', ?)""",
+            (f.stem, f.stem, f.name, content, description, now_iso()))
+        count += 1
+    db().commit()
+    return count
+
+
+# ══════════════════════════════════════════════════════════
 #  Routes: Agents
 # ══════════════════════════════════════════════════════════
-@app.post("/api/agents/register", summary="注册智能体")
+@app.post("/api/agents/register", summary="注册智能体", dependencies=[Depends(require_auth)])
 async def register_agent(req: AgentRegisterReq):
     agent_id = req.agent_id or str(uuid.uuid4())[:8]
     n = now_iso()
@@ -698,7 +816,7 @@ async def register_agent(req: AgentRegisterReq):
     return {"agent_id": agent_id, "status": "registered"}
 
 
-@app.get("/api/agents", summary="列出所有智能体")
+@app.get("/api/agents", summary="列出所有智能体", dependencies=[Depends(require_auth)])
 async def list_agents(role: str = None, status: str = None):
     sql = "SELECT * FROM agents"
     params = []
@@ -724,7 +842,7 @@ async def list_agents(role: str = None, status: str = None):
     return {"agents": agents}
 
 
-@app.get("/api/agents/{agent_id}", summary="获取单个智能体")
+@app.get("/api/agents/{agent_id}", summary="获取单个智能体", dependencies=[Depends(require_auth)])
 async def get_agent(agent_id: str):
     row = db().execute("SELECT * FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
     if not row:
@@ -738,7 +856,7 @@ async def get_agent(agent_id: str):
             "current_task":   hot.agent_task.get(agent_id)}
 
 
-@app.post("/api/agents/{agent_id}/heartbeat", summary="发送心跳")
+@app.post("/api/agents/{agent_id}/heartbeat", summary="发送心跳", dependencies=[Depends(require_auth)])
 async def heartbeat(agent_id: str, req: HeartbeatReq):
     if not db().execute("SELECT 1 FROM agents WHERE agent_id=?", (agent_id,)).fetchone():
         raise HTTPException(404, "Agent not found")
@@ -753,7 +871,7 @@ async def heartbeat(agent_id: str, req: HeartbeatReq):
     return {"ok": True, "ts": now_ts()}
 
 
-@app.get("/api/agents/{agent_id}/metrics", summary="获取智能体指标")
+@app.get("/api/agents/{agent_id}/metrics", summary="获取智能体指标", dependencies=[Depends(require_auth)])
 async def agent_metrics(agent_id: str):
     if not db().execute("SELECT 1 FROM agents WHERE agent_id=?", (agent_id,)).fetchone():
         raise HTTPException(404, "Agent not found")
@@ -775,7 +893,7 @@ async def agent_metrics(agent_id: str):
     }
 
 
-@app.delete("/api/agents/{agent_id}", summary="注销智能体")
+@app.delete("/api/agents/{agent_id}", summary="注销智能体", dependencies=[Depends(require_auth)])
 async def deregister_agent(agent_id: str):
     row = db().execute("SELECT name FROM agents WHERE agent_id=?", (agent_id,)).fetchone()
     if not row:
@@ -792,7 +910,7 @@ async def deregister_agent(agent_id: str):
 # ══════════════════════════════════════════════════════════
 #  Routes: Tasks
 # ══════════════════════════════════════════════════════════
-@app.post("/api/tasks", summary="创建任务")
+@app.post("/api/tasks", summary="创建任务", dependencies=[Depends(require_auth)])
 async def create_task(req: TaskCreateReq):
     task_id = "T-" + str(uuid.uuid4())[:6].upper()
     n = now_iso()
@@ -820,7 +938,7 @@ async def create_task(req: TaskCreateReq):
     return {"task_id": task_id}
 
 
-@app.post("/api/tasks/{task_id}/complete", summary="完成任务")
+@app.post("/api/tasks/{task_id}/complete", summary="完成任务", dependencies=[Depends(require_auth)])
 async def complete_task(task_id: str, agent_id: str, req: TaskResultReq):
     row = db().execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     if not row:
@@ -843,7 +961,7 @@ async def complete_task(task_id: str, agent_id: str, req: TaskResultReq):
     return {"ok": True}
 
 
-@app.get("/api/tasks", summary="列出任务")
+@app.get("/api/tasks", summary="列出任务", dependencies=[Depends(require_auth)])
 async def list_tasks(
     status:   str = None,
     priority: str = None,
@@ -870,7 +988,7 @@ async def list_tasks(
     return {"tasks": tasks, "total": total, "limit": limit, "offset": offset}
 
 
-@app.get("/api/tasks/{task_id}", summary="获取单个任务")
+@app.get("/api/tasks/{task_id}", summary="获取单个任务", dependencies=[Depends(require_auth)])
 async def get_task(task_id: str):
     row = db().execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
     if not row:
@@ -878,7 +996,7 @@ async def get_task(task_id: str):
     return dict(row)
 
 
-@app.delete("/api/tasks/{task_id}", summary="删除任务")
+@app.delete("/api/tasks/{task_id}", summary="删除任务", dependencies=[Depends(require_auth)])
 async def delete_task(task_id: str):
     if not db().execute("SELECT 1 FROM tasks WHERE task_id=?", (task_id,)).fetchone():
         raise HTTPException(404, "Task not found")
@@ -890,7 +1008,7 @@ async def delete_task(task_id: str):
 # ══════════════════════════════════════════════════════════
 #  Routes: Knowledge bases
 # ══════════════════════════════════════════════════════════
-@app.get("/api/knowledge", summary="列出知识库")
+@app.get("/api/knowledge", summary="列出知识库", dependencies=[Depends(require_auth)])
 async def list_kbs():
     rows = db().execute("SELECT * FROM knowledge_bases ORDER BY created_at").fetchall()
     kbs = []
@@ -909,7 +1027,7 @@ async def list_kbs():
     return {"knowledge_bases": kbs}
 
 
-@app.post("/api/knowledge", summary="添加知识库")
+@app.post("/api/knowledge", summary="添加知识库", dependencies=[Depends(require_auth)])
 async def create_kb(req: KbCreateReq):
     kb_id = "kb" + str(uuid.uuid4())[:6]
     n = now_iso()
@@ -922,7 +1040,7 @@ async def create_kb(req: KbCreateReq):
     return {"kb_id": kb_id}
 
 
-@app.patch("/api/knowledge/{kb_id}", summary="更新知识库")
+@app.patch("/api/knowledge/{kb_id}", summary="更新知识库", dependencies=[Depends(require_auth)])
 async def update_kb(kb_id: str, req: KbUpdateReq):
     row = db().execute("SELECT * FROM knowledge_bases WHERE kb_id=?", (kb_id,)).fetchone()
     if not row:
@@ -938,7 +1056,7 @@ async def update_kb(kb_id: str, req: KbUpdateReq):
     return {"ok": True}
 
 
-@app.post("/api/knowledge/{kb_id}/sync", summary="触发同步")
+@app.post("/api/knowledge/{kb_id}/sync", summary="触发同步", dependencies=[Depends(require_auth)])
 async def sync_kb(kb_id: str):
     row = db().execute("SELECT name FROM knowledge_bases WHERE kb_id=?", (kb_id,)).fetchone()
     if not row:
@@ -958,7 +1076,7 @@ async def sync_kb(kb_id: str):
     return {"ok": True}
 
 
-@app.delete("/api/knowledge/{kb_id}", summary="删除知识库")
+@app.delete("/api/knowledge/{kb_id}", summary="删除知识库", dependencies=[Depends(require_auth)])
 async def delete_kb(kb_id: str):
     if not db().execute("SELECT 1 FROM knowledge_bases WHERE kb_id=?", (kb_id,)).fetchone():
         raise HTTPException(404, "KB not found")
@@ -967,7 +1085,7 @@ async def delete_kb(kb_id: str):
     return {"ok": True}
 
 
-@app.post("/api/knowledge/query", summary="知识库查询（转发到 Hermes）")
+@app.post("/api/knowledge/query", summary="知识库查询（转发到 Hermes）", dependencies=[Depends(require_auth)])
 async def kb_query(kb_id: Optional[str] = None, q: str = ""):
     if not q:
         raise HTTPException(400, "Query string required")
@@ -998,13 +1116,13 @@ async def kb_query(kb_id: Optional[str] = None, q: str = ""):
 # ══════════════════════════════════════════════════════════
 #  Routes: Alerts
 # ══════════════════════════════════════════════════════════
-@app.get("/api/alerts/rules", summary="列出告警规则")
+@app.get("/api/alerts/rules", summary="列出告警规则", dependencies=[Depends(require_auth)])
 async def list_rules():
     rows = db().execute("SELECT * FROM alert_rules ORDER BY created_at").fetchall()
     return {"rules": [dict(r) for r in rows]}
 
 
-@app.post("/api/alerts/rules", summary="创建告警规则")
+@app.post("/api/alerts/rules", summary="创建告警规则", dependencies=[Depends(require_auth)])
 async def create_rule(req: AlertRuleReq):
     rid = "r" + str(uuid.uuid4())[:6]
     db().execute(
@@ -1016,7 +1134,7 @@ async def create_rule(req: AlertRuleReq):
     return {"rule_id": rid}
 
 
-@app.patch("/api/alerts/rules/{rule_id}", summary="更新告警规则")
+@app.patch("/api/alerts/rules/{rule_id}", summary="更新告警规则", dependencies=[Depends(require_auth)])
 async def update_rule(rule_id: str, enabled: Optional[bool] = None, name: Optional[str] = None):
     if not db().execute("SELECT 1 FROM alert_rules WHERE rule_id=?", (rule_id,)).fetchone():
         raise HTTPException(404, "Rule not found")
@@ -1028,14 +1146,14 @@ async def update_rule(rule_id: str, enabled: Optional[bool] = None, name: Option
     return {"ok": True}
 
 
-@app.delete("/api/alerts/rules/{rule_id}", summary="删除告警规则")
+@app.delete("/api/alerts/rules/{rule_id}", summary="删除告警规则", dependencies=[Depends(require_auth)])
 async def delete_rule(rule_id: str):
     db().execute("DELETE FROM alert_rules WHERE rule_id=?", (rule_id,))
     db().commit()
     return {"ok": True}
 
 
-@app.get("/api/alerts", summary="列出告警")
+@app.get("/api/alerts", summary="列出告警", dependencies=[Depends(require_auth)])
 async def list_alerts(level: str = None, acknowledged: bool = None, limit: int = 50):
     sql = "SELECT * FROM alerts WHERE 1=1"
     params: list = []
@@ -1049,14 +1167,14 @@ async def list_alerts(level: str = None, acknowledged: bool = None, limit: int =
     return {"alerts": [dict(r) for r in rows]}
 
 
-@app.post("/api/alerts/{alert_id}/acknowledge", summary="确认告警")
+@app.post("/api/alerts/{alert_id}/acknowledge", summary="确认告警", dependencies=[Depends(require_auth)])
 async def ack_alert(alert_id: str):
     db().execute("UPDATE alerts SET acknowledged=1 WHERE alert_id=?", (alert_id,))
     db().commit()
     return {"ok": True}
 
 
-@app.delete("/api/alerts", summary="清空告警")
+@app.delete("/api/alerts", summary="清空告警", dependencies=[Depends(require_auth)])
 async def clear_alerts():
     db().execute("DELETE FROM alerts")
     db().commit()
@@ -1066,7 +1184,7 @@ async def clear_alerts():
 # ══════════════════════════════════════════════════════════
 #  Routes: Agent-to-agent messaging
 # ══════════════════════════════════════════════════════════
-@app.post("/api/agents/{agent_id}/message", summary="发送消息给智能体")
+@app.post("/api/agents/{agent_id}/message", summary="发送消息给智能体", dependencies=[Depends(require_auth)])
 async def send_message(agent_id: str, req: MessageReq):
     """Route a message from one agent to another. Target agent can poll /inbox."""
     if not db().execute("SELECT 1 FROM agents WHERE agent_id=?", (agent_id,)).fetchone():
@@ -1099,7 +1217,7 @@ async def send_message(agent_id: str, req: MessageReq):
     return {"msg_id": msg_id}
 
 
-@app.get("/api/agents/{agent_id}/inbox", summary="获取智能体收件箱")
+@app.get("/api/agents/{agent_id}/inbox", summary="获取智能体收件箱", dependencies=[Depends(require_auth)])
 async def get_inbox(agent_id: str, unread_only: bool = True):
     """Drain the in-memory queue (instant) + DB history."""
     pending = hot.message_queues.pop(agent_id, [])
@@ -1118,7 +1236,7 @@ async def get_inbox(agent_id: str, unread_only: bool = True):
 # ══════════════════════════════════════════════════════════
 #  Routes: LLM proxy (with streaming + multi-turn)
 # ══════════════════════════════════════════════════════════
-@app.post("/api/chat", summary="调用 Hermes LLM")
+@app.post("/api/chat", summary="调用 Hermes LLM", dependencies=[Depends(require_auth)])
 async def chat(req: ChatReq):
     messages = [{"role": "system", "content": req.system}]
     messages.extend(req.history)
@@ -1187,7 +1305,7 @@ async def _stream_chat(messages: list, agent_id: Optional[str], model: Optional[
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 
-@app.get("/api/models", summary="列出 Ollama 模型")
+@app.get("/api/models", summary="列出 Ollama 模型", dependencies=[Depends(require_auth)])
 async def list_models():
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -1200,25 +1318,25 @@ async def list_models():
 # ══════════════════════════════════════════════════════════
 #  Routes: Stats, Events, Health
 # ══════════════════════════════════════════════════════════
-@app.get("/api/stats", summary="全局统计快照")
+@app.get("/api/stats", summary="全局统计快照", dependencies=[Depends(require_auth)])
 async def get_stats():
     return build_stats()
 
 
-@app.get("/api/events", summary="协同事件流")
+@app.get("/api/events", summary="协同事件流", dependencies=[Depends(require_auth)])
 async def get_events(limit: int = Query(30, le=200)):
     # Merge in-memory recent + DB history
     mem_events = list(hot.events)[-limit:]
     return {"events": mem_events}
 
 
-@app.get("/api/resources", summary="实时系统资源")
+@app.get("/api/resources", summary="实时系统资源", dependencies=[Depends(require_auth)])
 async def get_resources():
     return get_real_resources()
 
 
 # ── Agent Logs ────────────────────────────────────────────
-@app.post("/api/agents/{agent_id}/log", summary="写入 Agent 日志")
+@app.post("/api/agents/{agent_id}/log", summary="写入 Agent 日志", dependencies=[Depends(require_auth)])
 async def write_agent_log(agent_id: str, req: AgentLogReq):
     log_id = str(uuid.uuid4())[:8]
     ts = time.time()
@@ -1228,7 +1346,7 @@ async def write_agent_log(agent_id: str, req: AgentLogReq):
     await ws_mgr.broadcast({"type": "agent_log", "agent_id": agent_id, "level": req.level, "message": req.message})
     return {"ok": True, "log_id": log_id}
 
-@app.get("/api/agents/{agent_id}/logs", summary="查询 Agent 日志")
+@app.get("/api/agents/{agent_id}/logs", summary="查询 Agent 日志", dependencies=[Depends(require_auth)])
 async def get_agent_logs(agent_id: str, level: str = "", limit: int = 50, offset: int = 0):
     sql = "SELECT * FROM agent_logs WHERE agent_id=?"
     params = [agent_id]
@@ -1240,13 +1358,13 @@ async def get_agent_logs(agent_id: str, level: str = "", limit: int = 50, offset
     rows = db().execute(sql, params).fetchall()
     return {"logs": [dict(r) for r in rows]}
 
-@app.get("/api/stats/tokens", summary="Token 消耗统计")
+@app.get("/api/stats/tokens", summary="Token 消耗统计", dependencies=[Depends(require_auth)])
 async def get_token_stats():
     agents = db().execute("SELECT agent_id, name, metrics FROM agents").fetchall()
     return _compute_token_stats([dict(a) for a in agents])
 
 # ── Peer Nodes ────────────────────────────────────────────
-@app.post("/api/peers/join", summary="节点加入")
+@app.post("/api/peers/join", summary="节点加入", dependencies=[Depends(require_auth)])
 async def peer_join(req: dict):
     node_id = req.get("node_id", "")
     url = req.get("url", "")
@@ -1263,17 +1381,17 @@ async def peer_join(req: dict):
     add_event("system", None, f"节点 {node_id} 加入", "info")
     return {"ok": True}
 
-@app.get("/api/peers", summary="列出对等节点")
+@app.get("/api/peers", summary="列出对等节点", dependencies=[Depends(require_auth)])
 async def list_peers():
     return {"peers": _get_peer_list()}
 
-@app.delete("/api/peers/{node_id}", summary="移除节点")
+@app.delete("/api/peers/{node_id}", summary="移除节点", dependencies=[Depends(require_auth)])
 async def remove_peer(node_id: str):
     db().execute("DELETE FROM peer_nodes WHERE node_id=?", (node_id,))
     db().commit()
     return {"ok": True}
 
-@app.post("/api/peers/{node_id}/sync", summary="同步对端 Agent")
+@app.post("/api/peers/{node_id}/sync", summary="同步对端 Agent", dependencies=[Depends(require_auth)])
 async def sync_peer(node_id: str):
     row = db().execute("SELECT * FROM peer_nodes WHERE node_id=?", (node_id,)).fetchone()
     if not row:
@@ -1295,7 +1413,7 @@ async def sync_peer(node_id: str):
     except Exception as e:
         raise HTTPException(500, str(e))
 
-@app.get("/api/knowledge/global", summary="跨节点知识库汇总")
+@app.get("/api/knowledge/global", summary="跨节点知识库汇总", dependencies=[Depends(require_auth)])
 async def global_knowledge():
     local = db().execute("SELECT * FROM knowledge_bases").fetchall()
     result = {"local": [dict(r) for r in local], "remote": []}
@@ -1309,7 +1427,7 @@ async def global_knowledge():
             pass
     return result
 
-@app.post("/api/knowledge/{kb_id}/broadcast", summary="广播知识库到对等节点")
+@app.post("/api/knowledge/{kb_id}/broadcast", summary="广播知识库到对等节点", dependencies=[Depends(require_auth)])
 async def broadcast_kb(kb_id: str):
     kb = db().execute("SELECT * FROM knowledge_bases WHERE kb_id=?", (kb_id,)).fetchone()
     if not kb:
@@ -1326,7 +1444,7 @@ async def broadcast_kb(kb_id: str):
     return {"sent_to": sent}
 
 # ── Task Intervention ─────────────────────────────────────
-@app.post("/api/tasks/{task_id}/pause", summary="暂停任务")
+@app.post("/api/tasks/{task_id}/pause", summary="暂停任务", dependencies=[Depends(require_auth)])
 async def pause_task(task_id: str):
     db().execute("UPDATE tasks SET status='paused' WHERE task_id=?", (task_id,))
     db().commit()
@@ -1334,7 +1452,7 @@ async def pause_task(task_id: str):
     await ws_mgr.broadcast({"type": "task_paused", "task_id": task_id, "data": build_stats()})
     return {"ok": True}
 
-@app.post("/api/tasks/{task_id}/resume", summary="恢复任务")
+@app.post("/api/tasks/{task_id}/resume", summary="恢复任务", dependencies=[Depends(require_auth)])
 async def resume_task(task_id: str):
     db().execute("UPDATE tasks SET status='pending' WHERE task_id=?", (task_id,))
     db().commit()
@@ -1342,7 +1460,7 @@ async def resume_task(task_id: str):
     await ws_mgr.broadcast({"type": "task_resumed", "task_id": task_id, "data": build_stats()})
     return {"ok": True}
 
-@app.post("/api/tasks/{task_id}/retry", summary="重试任务")
+@app.post("/api/tasks/{task_id}/retry", summary="重试任务", dependencies=[Depends(require_auth)])
 async def retry_task(task_id: str):
     db().execute("UPDATE tasks SET status='pending', retry_count=retry_count+1 WHERE task_id=?", (task_id,))
     db().commit()
@@ -1350,7 +1468,7 @@ async def retry_task(task_id: str):
     await ws_mgr.broadcast({"type": "task_retry", "task_id": task_id, "data": build_stats()})
     return {"ok": True}
 
-@app.patch("/api/tasks/{task_id}/context", summary="编辑任务上下文")
+@app.patch("/api/tasks/{task_id}/context", summary="编辑任务上下文", dependencies=[Depends(require_auth)])
 async def update_task_context(task_id: str, req: TaskContextReq):
     db().execute("UPDATE tasks SET context_snapshot=?, status='pending' WHERE task_id=?",
                  (json.dumps(req.context_snapshot), task_id))
@@ -1358,7 +1476,7 @@ async def update_task_context(task_id: str, req: TaskContextReq):
     await ws_mgr.broadcast({"type": "task_context_updated", "task_id": task_id, "data": build_stats()})
     return {"ok": True}
 
-@app.post("/api/tasks/{task_id}/reassign", summary="重新分配任务")
+@app.post("/api/tasks/{task_id}/reassign", summary="重新分配任务", dependencies=[Depends(require_auth)])
 async def reassign_task(task_id: str, req: TaskReassignReq):
     db().execute("UPDATE tasks SET assigned_to=?, status='pending' WHERE task_id=?",
                  (req.agent_id, task_id))
@@ -1368,7 +1486,7 @@ async def reassign_task(task_id: str, req: TaskReassignReq):
     return {"ok": True}
 
 # ── Workflows ─────────────────────────────────────────────
-@app.post("/api/workflows", summary="创建工作流")
+@app.post("/api/workflows", summary="创建工作流", dependencies=[Depends(require_auth)])
 async def create_workflow(req: WorkflowCreateReq):
     wf_id = f"wf-{str(uuid.uuid4())[:6]}"
     task_ids = []
@@ -1389,7 +1507,7 @@ async def create_workflow(req: WorkflowCreateReq):
     await ws_mgr.broadcast({"type": "workflow_created", "workflow_id": wf_id, "data": build_stats()})
     return {"workflow_id": wf_id, "task_ids": task_ids}
 
-@app.get("/api/workflows/{wf_id}", summary="查看工作流")
+@app.get("/api/workflows/{wf_id}", summary="查看工作流", dependencies=[Depends(require_auth)])
 async def get_workflow(wf_id: str):
     wf = db().execute("SELECT * FROM workflows WHERE workflow_id=?", (wf_id,)).fetchone()
     if not wf:
@@ -1397,7 +1515,7 @@ async def get_workflow(wf_id: str):
     tasks = db().execute("SELECT * FROM tasks WHERE workflow_id=?", (wf_id,)).fetchall()
     return {"workflow": dict(wf), "tasks": [dict(t) for t in tasks]}
 
-@app.post("/api/workflows/{wf_id}/pause", summary="暂停工作流")
+@app.post("/api/workflows/{wf_id}/pause", summary="暂停工作流", dependencies=[Depends(require_auth)])
 async def pause_workflow(wf_id: str):
     db().execute("UPDATE workflows SET status='paused' WHERE workflow_id=?", (wf_id,))
     db().execute("UPDATE tasks SET status='paused' WHERE workflow_id=? AND status='pending'", (wf_id,))
@@ -1405,13 +1523,117 @@ async def pause_workflow(wf_id: str):
     await ws_mgr.broadcast({"type": "workflow_paused", "data": build_stats()})
     return {"ok": True}
 
-@app.post("/api/workflows/{wf_id}/resume", summary="恢复工作流")
+@app.post("/api/workflows/{wf_id}/resume", summary="恢复工作流", dependencies=[Depends(require_auth)])
 async def resume_workflow(wf_id: str):
     db().execute("UPDATE workflows SET status='running' WHERE workflow_id=?", (wf_id,))
     db().execute("UPDATE tasks SET status='pending' WHERE workflow_id=? AND status='paused'", (wf_id,))
     db().commit()
     await ws_mgr.broadcast({"type": "workflow_resumed", "data": build_stats()})
     return {"ok": True}
+
+
+# ── GitHub Sync ──────────────────────────────────────────
+@app.post("/api/shared/sync", summary="同步 GitHub 仓库", dependencies=[Depends(require_auth)])
+async def sync_shared_repo():
+    result = _git_sync_pull()
+    skill_count = 0
+    if result["ok"]:
+        skill_count = _index_skills_to_db()
+        add_event("system", None, f"GitHub 同步完成，更新 {skill_count} 个 Skills", "success")
+        await ws_mgr.broadcast({"type": "shared_synced", "skill_count": skill_count, "ts": now_iso()})
+    return {**result, "skill_count": skill_count, "synced_at": now_iso()}
+
+@app.post("/api/shared/push", summary="推送到 GitHub", dependencies=[Depends(require_auth)])
+async def push_shared_repo(message: str = "Auto-sync from SGA Hub"):
+    result = _git_sync_push(message)
+    if result["ok"]:
+        add_event("system", None, f"已推送到 GitHub: {message}", "info")
+    return result
+
+@app.get("/api/skills", summary="列出 Skills", dependencies=[Depends(require_auth)])
+async def list_skills_api(tag: str = "", search: str = ""):
+    rows = db().execute("SELECT skill_id, name, filename, description, tags, synced_at FROM skills").fetchall()
+    skills = [dict(r) for r in rows]
+    if tag:
+        skills = [s for s in skills if tag in s.get("tags", "")]
+    if search:
+        skills = [s for s in skills if search.lower() in s["name"].lower() or search.lower() in s["description"].lower()]
+    return {"skills": skills, "total": len(skills)}
+
+@app.get("/api/skills/{skill_name}", summary="获取 Skill 内容", dependencies=[Depends(require_auth)])
+async def get_skill_api(skill_name: str):
+    row = db().execute("SELECT * FROM skills WHERE name=?", (skill_name,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"Skill '{skill_name}' 不存在")
+    return dict(row)
+
+
+# ── File Transfer ────────────────────────────────────────
+@app.post("/api/files/upload", summary="上传任务文件", dependencies=[Depends(require_auth)])
+async def upload_file(task_id: str, agent_id: str, file: UploadFile = File(...)):
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, f"文件超过 {MAX_UPLOAD_SIZE // 1024 // 1024}MB 限制")
+    task_dir = FILES_DIR / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    file_path = task_dir / file.filename
+    async with aiofiles.open(file_path, "wb") as f:
+        await f.write(content)
+    file_hash = hashlib.md5(content).hexdigest()
+    mime = mimetypes.guess_type(file.filename)[0] or "application/octet-stream"
+    file_id = str(uuid.uuid4())[:8]
+    db().execute("""INSERT OR REPLACE INTO task_files
+        (file_id, task_id, filename, uploader, size_bytes, md5, mime_type, download_url, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)""",
+        (file_id, task_id, file.filename, agent_id, len(content), file_hash, mime,
+         f"/api/files/{task_id}/{file.filename}", now_iso()))
+    db().commit()
+    await ws_mgr.broadcast({"type": "file_available", "file_id": file_id, "task_id": task_id,
+                            "filename": file.filename, "uploader": agent_id, "size_bytes": len(content)})
+    add_event(agent_id, None, f"上传文件: {file.filename} ({len(content)//1024}KB)", "info", task_id=task_id)
+    return {"ok": True, "file_id": file_id, "file_hash": file_hash, "size_bytes": len(content),
+            "download_url": f"/api/files/{task_id}/{file.filename}"}
+
+@app.get("/api/files/{task_id}/{filename}", summary="下载任务文件", dependencies=[Depends(require_auth)])
+async def download_file(task_id: str, filename: str):
+    file_path = FILES_DIR / task_id / filename
+    if not file_path.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(str(file_path), filename=filename,
+                        media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream")
+
+@app.get("/api/files/{task_id}", summary="列出任务文件", dependencies=[Depends(require_auth)])
+async def list_task_files(task_id: str):
+    rows = db().execute("SELECT * FROM task_files WHERE task_id=? ORDER BY created_at", (task_id,)).fetchall()
+    return {"files": [dict(r) for r in rows]}
+
+@app.delete("/api/files/{task_id}/{filename}", summary="删除任务文件", dependencies=[Depends(require_auth)])
+async def delete_file(task_id: str, filename: str):
+    file_path = FILES_DIR / task_id / filename
+    if file_path.exists():
+        file_path.unlink()
+    db().execute("DELETE FROM task_files WHERE task_id=? AND filename=?", (task_id, filename))
+    db().commit()
+    return {"ok": True}
+
+
+# ── GitHub Webhook ───────────────────────────────────────
+@app.post("/api/github/webhook", summary="GitHub Webhook")
+async def github_webhook(request: Request):
+    if GITHUB_WEBHOOK_SECRET:
+        sig = request.headers.get("X-Hub-Signature-256", "")
+        body = await request.body()
+        expected = "sha256=" + hmac.new(GITHUB_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(403, "Invalid webhook signature")
+    event = request.headers.get("X-GitHub-Event", "")
+    if event == "push":
+        result = _git_sync_pull()
+        if result["ok"]:
+            _index_skills_to_db()
+            add_event("system", None, "GitHub push 触发自动同步", "info")
+        return {"ok": True, "event": event}
+    return {"ok": True, "event": event, "action": "ignored"}
 
 
 @app.get("/health", summary="健康检查")
@@ -1425,7 +1647,7 @@ async def health():
         pass
     return {
         "status":        "ok",
-        "version":       "2.0.0",
+        "version":       "3.0.0",
         "agents":        len(hot.agent_status),
         "tasks":         db().execute("SELECT COUNT(*) as c FROM tasks").fetchone()["c"],
         "ws_clients":    len(ws_mgr.clients),

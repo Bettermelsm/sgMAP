@@ -44,6 +44,14 @@ def _make_agent_id() -> str:
     short = str(uuid.uuid4())[:6]
     return f"{fp}:{short}"
 
+SDK_API_KEY = os.getenv("SGA_API_KEY", "")
+
+def auth_headers() -> dict:
+    h = {"Content-Type": "application/json"}
+    if SDK_API_KEY:
+        h["X-Api-Key"] = SDK_API_KEY
+    return h
+
 
 class AgentMetrics:
     tokens_in: int = 0
@@ -142,6 +150,7 @@ class AgentClient:
                     "description":  self.description,
                     "agent_id":     _make_agent_id(),
                 },
+                headers=auth_headers(),
                 timeout=10,
             )
             resp.raise_for_status()
@@ -239,6 +248,7 @@ class AgentClient:
                     "priority":    priority,
                     "assigned_to": assigned_to or self.agent_id,
                 },
+                headers=auth_headers(),
                 timeout=10,
             )
             resp.raise_for_status()
@@ -256,6 +266,7 @@ class AgentClient:
                 f"{self.platform_url}/api/tasks/{task_id}/complete"
                 f"?agent_id={self.agent_id}",
                 json={"summary": summary, "data": data or {}},
+                headers=auth_headers(),
                 timeout=10,
             )
         self._status = "idle"
@@ -310,6 +321,7 @@ class AgentClient:
                     "history":  self._conversation.copy() if remember else [],
                     "stream":   False,
                 },
+                headers=auth_headers(),
                 timeout=90,
             )
             resp.raise_for_status()
@@ -348,6 +360,7 @@ class AgentClient:
                     "history":  [],
                     "stream":   True,
                 },
+                headers=auth_headers(),
             ) as resp:
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -417,6 +430,7 @@ class AgentClient:
             resp = await c.post(
                 f"{self.platform_url}/api/agents/{self.agent_id}/message",
                 json={"to_agent": to_agent, "content": content, "msg_type": msg_type},
+                headers=auth_headers(),
                 timeout=10,
             )
             resp.raise_for_status()
@@ -427,6 +441,7 @@ class AgentClient:
         async with self._client() as c:
             resp = await c.get(
                 f"{self.platform_url}/api/agents/{self.agent_id}/inbox",
+                headers=auth_headers(),
                 timeout=10,
             )
             resp.raise_for_status()
@@ -442,6 +457,7 @@ class AgentClient:
                 await c.post(
                     f"{self.platform_url}/api/agents/{self.agent_id}/heartbeat",
                     json={"status": status, "metrics": {}},
+                    headers=auth_headers(),
                     timeout=5,
                 )
 
@@ -450,10 +466,102 @@ class AgentClient:
         async with self._client() as c:
             resp = await c.get(
                 f"{self.platform_url}/api/agents/{self.agent_id}/metrics",
+                headers=auth_headers(),
                 timeout=10,
             )
             resp.raise_for_status()
             return resp.json()
+
+    async def log(self, message: str, level: str = "info", task_id: str = "", context: dict = None):
+        """向 Hub 上报结构化日志"""
+        async with self._client() as c:
+            await c.post(
+                f"{self.platform_url}/api/agents/{self.agent_id}/log",
+                json={"level": level, "message": message, "context": context or {}},
+                headers=auth_headers(),
+                timeout=5,
+            )
+
+    async def get_pending_task(self) -> Optional[dict]:
+        """拉取分配给自己的待执行任务"""
+        async with self._client() as c:
+            resp = await c.get(
+                f"{self.platform_url}/api/tasks?status=running&agent_id={self.agent_id}&limit=1",
+                headers=auth_headers(),
+                timeout=5,
+            )
+            resp.raise_for_status()
+            tasks = resp.json().get("tasks", [])
+            return tasks[0] if tasks else None
+
+    async def upload_file(self, task_id: str, filepath: str) -> dict:
+        """上传文件到 Hub"""
+        import aiofiles
+        filename = os.path.basename(filepath)
+        async with aiofiles.open(filepath, "rb") as f:
+            content = await f.read()
+        headers = {}
+        if SDK_API_KEY:
+            headers["X-Api-Key"] = SDK_API_KEY
+        async with self._client(timeout=120) as c:
+            resp = await c.post(
+                f"{self.platform_url}/api/files/upload",
+                params={"task_id": task_id, "agent_id": self.agent_id},
+                files={"file": (filename, content)},
+                headers=headers,
+            )
+            resp.raise_for_status()
+        return resp.json()
+
+    async def download_file(self, task_id: str, filename: str, save_to: str):
+        """从 Hub 下载任务文件"""
+        import aiofiles
+        headers = auth_headers()
+        # Remove Content-Type for binary download
+        headers.pop("Content-Type", None)
+        async with self._client(timeout=120) as c:
+            resp = await c.get(
+                f"{self.platform_url}/api/files/{task_id}/{filename}",
+                headers=headers,
+            )
+            resp.raise_for_status()
+        async with aiofiles.open(save_to, "wb") as f:
+            await f.write(resp.content)
+
+    async def list_task_files(self, task_id: str) -> list:
+        """列出任务文件"""
+        async with self._client() as c:
+            resp = await c.get(
+                f"{self.platform_url}/api/files/{task_id}",
+                headers=auth_headers(),
+                timeout=5,
+            )
+            resp.raise_for_status()
+        return resp.json().get("files", [])
+
+    async def get_skill(self, skill_name: str) -> str:
+        """从 Hub 拉取 Skill 内容"""
+        async with self._client() as c:
+            resp = await c.get(
+                f"{self.platform_url}/api/skills/{skill_name}",
+                headers=auth_headers(),
+                timeout=10,
+            )
+            if resp.status_code == 404:
+                return ""
+            resp.raise_for_status()
+        return resp.json().get("content", "")
+
+    async def list_skills(self) -> list:
+        """获取 Skills 列表"""
+        async with self._client() as c:
+            resp = await c.get(
+                f"{self.platform_url}/api/skills",
+                headers=auth_headers(),
+                timeout=10,
+            )
+            resp.raise_for_status()
+        return resp.json().get("skills", [])
 
     # ── Internal loops ─────────────────────────────────────────────────
 
@@ -471,6 +579,7 @@ class AgentClient:
                     await c.post(
                         f"{self.platform_url}/api/agents/{self.agent_id}/heartbeat",
                         json={"status": self._status, "metrics": self._metrics.to_dict()},
+                        headers=auth_headers(),
                         timeout=5,
                     )
             except Exception as e:

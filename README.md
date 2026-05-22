@@ -183,6 +183,7 @@ async for token in agent.llm_stream("生成报告..."):
 ├── orchestrator.py      # DAG 任务调度引擎
 ├── peer_mesh.py         # 多节点互联模块
 ├── agent_sdk.py         # Agent SDK（Python）
+├── feishu_bot_agent.py  # 飞书 Bot Agent（群聊接入）
 ├── index.html           # 看板前端
 ├── demo_agents.py       # 演示 Agent 脚本
 ├── start.sh             # 一键启动脚本
@@ -193,5 +194,85 @@ async for token in agent.llm_stream("生成报告..."):
 │   ├── start_hub.sh     # 云端 Hub 启动
 │   └── start_agent.sh   # 本地 Agent 启动
 └── docs/
-    └── QUICKSTART.md    # 5 分钟快速上手
+    ├── QUICKSTART.md             # 5 分钟快速上手
+    └── feishu_bot_deploy.md      # 飞书 Bot 部署指南
+```
+
+---
+
+## 使用指南
+
+### 1. 部署 Hub（只需一台服务器）
+
+```bash
+git clone https://github.com/Bettermelsm/SGA_Multi-Agent.git
+cd SGA_Multi-Agent
+pip install fastapi uvicorn httpx python-multipart psutil aiofiles
+
+# 局域网使用（无鉴权）
+uvicorn main:app --host 0.0.0.0 --port 9527
+
+# 公网部署（开启鉴权）
+export SGA_API_KEY=your-secret-key
+uvicorn main:app --host 0.0.0.0 --port 9527
+# 浏览器打开 http://your-server:9527
+```
+
+### 2. 智能体注册（任意机器）
+
+**只需 `agent_sdk.py` 一个文件**，不需要 clone 整个仓库。
+
+```python
+from agent_sdk import AgentClient
+
+agent = AgentClient(
+    name="我的智能体",
+    role="coder",
+    capabilities=["python", "code_review"],
+    platform_url="http://your-server:9527",  # Hub 地址
+)
+await agent.register()  # 自动生成跨机器唯一 ID 并注册
+```
+
+或通过环境变量：
+```bash
+export SGA_HUB_URL=http://your-server:9527
+export SGA_API_KEY=your-secret-key
+python demo_agents.py
+```
+
+**不同机器只需改 `platform_url` 指向同一个 Hub 即可。**
+
+### 3. 飞书群聊接入
+
+```bash
+pip install httpx websockets fastapi uvicorn psutil
+
+# 配置飞书应用凭证
+export SGA_HUB_URL=http://your-server:9527
+export SGA_API_KEY=your-secret-key
+export FEISHU_APP_ID=cli_xxxxx
+export FEISHU_APP_SECRET=xxxxx
+export FEISHU_VERIFY_TOKEN=xxxxx
+
+# 启动 Bot
+python feishu_bot_agent.py
+```
+
+详细部署步骤见 [docs/feishu_bot_deploy.md](docs/feishu_bot_deploy.md)。
+
+飞书群内指令：
+- `/task 分析这段代码` — 创建单个任务
+- `/workflow 完整代码审查流程` — 创建多步工作流
+- `/agents` — 查看在线智能体
+- `/status <工作流ID>` — 查询进度
+
+### 4. 工作方式
+
+```
+用户发指令 → Hub 创建任务 → Orchestrator 匹配最优空闲 Agent
+                                         ↓
+                              Agent 执行任务 → 完成后 Hub 广播结果
+                                         ↓
+                              飞书 Bot/看板 实时收到通知
 ```

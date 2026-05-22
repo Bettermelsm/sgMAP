@@ -192,6 +192,87 @@ async for token in agent.llm_stream("Generate a report..."):
 ├── scripts/
 │   ├── start_hub.sh     # Cloud Hub startup
 │   └── start_agent.sh   # Local Agent startup
+├── feishu_bot_agent.py  # Feishu Bot Agent
 └── docs/
-    └── QUICKSTART.md    # 5-minute quickstart
+    ├── QUICKSTART.md             # 5-minute quickstart
+    └── feishu_bot_deploy.md      # Feishu Bot deploy guide
+```
+
+---
+
+## Usage Guide
+
+### 1. Deploy Hub (one server only)
+
+```bash
+git clone https://github.com/Bettermelsm/SGA_Multi-Agent.git
+cd SGA_Multi-Agent
+pip install fastapi uvicorn httpx python-multipart psutil aiofiles
+
+# LAN use (no auth)
+uvicorn main:app --host 0.0.0.0 --port 9527
+
+# Public deployment (with auth)
+export SGA_API_KEY=your-secret-key
+uvicorn main:app --host 0.0.0.0 --port 9527
+# Open browser → http://your-server:9527
+```
+
+### 2. Agent Registration (any machine)
+
+**Only `agent_sdk.py` is needed** — no need to clone the entire repo.
+
+```python
+from agent_sdk import AgentClient
+
+agent = AgentClient(
+    name="My Agent",
+    role="coder",
+    capabilities=["python", "code_review"],
+    platform_url="http://your-server:9527",  # Hub address
+)
+await agent.register()  # Auto-generates cross-machine unique ID
+```
+
+Or via environment variables:
+```bash
+export SGA_HUB_URL=http://your-server:9527
+export SGA_API_KEY=your-secret-key
+python demo_agents.py
+```
+
+**Machines on different platforms just need to point `platform_url` to the same Hub.**
+
+### 3. Feishu Group Chat Integration
+
+```bash
+pip install httpx websockets fastapi uvicorn psutil
+
+# Configure Feishu app credentials
+export SGA_HUB_URL=http://your-server:9527
+export SGA_API_KEY=your-secret-key
+export FEISHU_APP_ID=cli_xxxxx
+export FEISHU_APP_SECRET=xxxxx
+export FEISHU_VERIFY_TOKEN=xxxxx
+
+# Start Bot
+python feishu_bot_agent.py
+```
+
+See [docs/feishu_bot_deploy.md](docs/feishu_bot_deploy.md) for detailed deployment steps.
+
+Feishu group commands:
+- `/task analyze this code` — create a single task
+- `/workflow full code review process` — create a multi-step workflow
+- `/agents` — view online agents
+- `/status <workflow_id>` — query progress
+
+### 4. How It Works
+
+```
+User sends command → Hub creates task → Orchestrator matches best idle Agent
+                                                    ↓
+                                         Agent executes task → Hub broadcasts result
+                                                    ↓
+                                         Feishu Bot / Dashboard receive real-time notification
 ```
